@@ -1,3 +1,4 @@
+import { handleLatencyUpload, handleLatencyHistory } from './handlers/latencyDetail.js';
 import { initDatabase, weeklyCleanup, getMetricsHistory, clearHistory } from './database/schema.js';
 import { checkOfflineNodes, checkExpiringServers, checkResourceAlerts } from './services/notification.js';
 import { updateDatabase } from './database/updateDatabase.js';
@@ -278,6 +279,8 @@ export default {
     }
 
     const routes = [
+      { method: 'POST', path: '/update/latency', handler: () => handleLatencyUpload(request, env) },
+      { method: 'GET', path: '/api/history/latency', handler: async () => handleLatencyHistory(request, env, await ensureSiteSettings(), ctx) },
       { method: 'POST', path: '/update', handler: () => handleUpdate(request, env, ctx) },
       { method: 'GET', path: '/update', handler: () => handleUpdateWebSocketUpgrade(request, env) },
       { method: 'GET', path: '/__do/health', handler: async () => {

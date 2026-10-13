@@ -1,0 +1,79 @@
+# 自定义延迟监测 v0.1（待完成部署验收）
+
+用户 fork 基线：AnalNovaDe/CF-Server-Monitor @ 463bb1f9e11218b0e0a87a3672825d2a4ee30449。
+配套 Agent 基线：huilang-me/cfsm-agent @ 3e7353c82a25d3845ec5cffa45f053dbc3301559。
+约束：6 台服务器，每台最多 8 个目标，必须使用 Cloudflare 免费方案。不得为本功能开通付费。
+
+## 行为
+
+- 修改现有详情页的延迟和丢包区域，启用后以两个全宽图表替换；资源图表保持原样。
+- 默认 24h，可切换 10m/30m/1h/6h/12h/24h、以 5 分钟步长滑动时间范围、隐藏线路。与页面顶部的时间选择双向联动；顶部选择 2d/4d/7d 时，新图仅显示最近 24h。每 20 秒目标周期，真实时间轴，保留尖峰、失败和缺口，不插值补点。
+- 失败比例取最近五分钟已执行的尝试；不同目标和超过 45 秒的采样缺口重置统计窗口。单次失败另画顶部圆点；TCP 探测失败不等于 ICMP 丢包。
+- Agent 复用原有探测，不另起重复探测；旧指标仍使用原有摘要。LATENCY_DETAIL=1 才启用原始记录上传，并停用官方自动升级，防止覆盖自定义功能。
+- 原始时间戳使用 Worker Date 校准后的时间；校准前暂不记录。每分钟上传已闭合的分钟块，一块最多 32 次结果，一次最多 5 块。失败保留最多约 30 分钟内存队列；进程重启、长时间断网会有缺口，当前版本不提供磁盘补报队列。
+- 新上传通道为 HTTPS POST /update/latency，每分钟一次，复用现有 API_SECRET 鉴权，不改变原 WSS 频率。拒绝重定向和明文 HTTP。
+- D1 的 latency_detail 是六个固定节点槽、每槽 1440 分钟槽的循环表，不建立二级索引、不进行逐行过期删除。同一分钟不可重写，查询同时校验槽位和服务器 UUID，丢 ACK 重试幂等；新一天覆盖旧槽。接口只返回最近 24h，物理旧槽可能停留到下一次覆盖，但空间有界。
+- 历史接口 GET /api/history/latency?id=...&after=...，一次最多读取 180 分钟，通过 has_more/next_after 分页；初次全天约 8 页，后续回看 31 分钟补报区间。沿用站点登录、隐藏节点和 Turnstile 检查，缓存命中前仍验证权限。隐藏标签页不轮询。
+- 新功能默认关闭。LATENCY_DETAIL_SERVER_IDS 为空或去重后多于 6 个 ID 时，拒绝上传并回退原图。
+- 保留用户已在控制台开启的免费调用日志，部署配置明确启用 observability.logs 并持久化到控制台；目前采样率为 100%，按免费日志额度观察，后续可调整。CI 使用 npm ci 安装已锁定依赖，目标 Worker 名与现有 cf-server-monitor 一致，避免误建新 Worker/DO。日志开启后才采集新异常，不补采开启前的错误。
+
+## 验证命令（普通终端或 GitHub CI）
+
+```sh
+npm ci
+npm run test:all
+node --test test/latency-detail.test.js
+npm run build:frontend
+```
+
+测试使用 Miniflare 验证 D1 行为。若 Windows 本地限制进程管道，可设置 LATENCY_TEST_SQLITE=1 后运行新增测试，作为 SQLite SQL/业务逻辑兼容检查；这不能替代 Miniflare 和 Cloudflare 实测。
+
+`node scripts/preview-latency-demo.mjs` 生成真实图表组件的离线模拟数据预览，仅供交互验收，不是生产包。
+
+## 免费额度评估
+
+官方参考：https://developers.cloudflare.com/d1/platform/pricing/ 和 https://developers.cloudflare.com/durable-objects/platform/pricing/ 。核对日期 2026-10-13。
+
+- D1 Free：每天 100000 行写入、5000000 行读取；Workers/DO 也有各自限额。
+- 六台 × 八路 × 每 20 秒：207360 次测量/日，打包后稳定状态新增约 8640 数据行/日，不是每个测量一行。
+- 1440 分钟槽 × 六个固定节点槽，上限 8640 条分钟块；替换 UUID 也不会扩表。白名单顺序对应节点槽，保持现有顺序，试点后把其他 UUID 追加到末尾，避免重排导致历史暂时不可见。无二级索引，无删除 cron。重传相同 minute 不更新记录。
+- 这是设计估算，不是 Cloudflare 计费实测。尤其 WITHOUT ROWID 的具体 rows_written、D1 返回开销、冷启动、分页序列化 CPU 和整个账户其它项目用量，均应在试点中核验。不能将“8640 新数据行”写成完整账户用量保证。
+- 30 分钟重连补报会短时增加写入，但不制造重复分钟记录。单次 16KiB 输入上限、六节点白名单、每线路至少 15 秒的样本间隔限制用于约束本功能的数据规模。
+- 后续回看 31 分钟，约每节点每天 44640 行读取，六台约 267840 行；首次全天再加约 1440 行/节点/次。额外的节点鉴权查询、缓存失效和人为频繁刷新未包含在此估算里。
+- 单个完整页面持续打开时，新图轮询约 1440 请求/日；六台 Agent 正常新增上传约 8640 请求/日。访问人数和重复刷新会增加请求，不能保证任意公开流量都在免费额度内。
+
+2026-10-13/14 用户已通过截图确认账户使用 Free 方案，原有 Worker、D1、DO 用量已核对，账户没有其它 Worker 或 D1。现有基线不代表新增功能已经通过免费额度验收；先启用一台至少 24h 的试点，核对实际账户请求、读写行数、CPU、DO 与日志用量，再依据剩余免费额度决定是否扩到六台。超预算就关闭原始记录功能或调整设计，不升级付费；没有额外的 30% 余量硬门槛。当前没有实现跨整个账户的自动预算熔断。账户截图、试点节点 ID 和实际备份目录仅记录在私人交付资料中。
+
+## 启用顺序（验证通过后才执行）
+
+1. 备份 D1、当前 Worker 版本、试点服务器的 Agent 二进制和配置文件。先在测试部署验证。
+2. 对现有数据库执行 migrations-custom/001_latency_detail.sql，新增表，不修改原资源历史。
+3. 部署本 Worker 和前端。Cloudflare 变量 LATENCY_DETAIL_SERVER_IDS 先填写一台试点 UUID。不要把 UUID 或 API_SECRET 提交到公开源码。部署流程 keep_vars=true，保留控制台变量。
+4. 先确认新历史接口能返回 enabled=true；再安装对应 CPU 架构的自定义 Agent，配置文件增加 LATENCY_DETAIL="1"，AUTO_UPDATE="0"，沿用 SERVER_ID/SECRET/WORKER_URL。正常 systemd root 安装配置位置为 /etc/config/cf-probe/config.conf，二进制为 /usr/local/bin/cf-probe；非 root/OpenRC/其它安装位置需按已有服务配置操作，不能套用 root 路径。
+5. 试点一天：确认关页面也有历史，单次尖峰不被中位数削掉，失败显示为空和失败标记，断网恢复无重复，刷新/缩放正常；测量 Worker CPU、D1 rows_read/rows_written、DO 和账户总请求。
+6. 所有验收通过且免费余量足够，再将白名单扩到六台、升级其余 Agent。
+
+## 回退与后续更新
+
+- 关闭：清空 LATENCY_DETAIL_SERVER_IDS，前端恢复原图；各 Agent 将 LATENCY_DETAIL 改为 0 并重启，停止新增请求。可恢复备份的官方二进制和配置，原监控数据保持兼容。无需为了回退立即删除新表。
+- 已移除原 fork 每日自动上游同步。用户通知更新后，在新分支合并 upstream，保留本文、两端原始记录协议、数据库环形表、前端组件及测试；不能 hard reset 到上游或用整包覆盖。
+- 自定义 Worker 与 Agent 分别保留 Git 基线和功能提交。升级先跑旧回归测试及新增测试，重新编译 Agent，最后试点。
+- API / Agent 协议改动时先保持向后兼容，再切换 Agent；新字段不得进入旧动态配置的 MD5，避免无关配置反复下发。
+
+## 本机实际验证状态
+
+- Go 全套测试和新增四项测试通过；Linux amd64/arm64 可交叉编译。
+- 2026-10-13 用户在普通 Windows 终端运行一键验证，日志最终为 FULL VERIFICATION PASSED；日志已读取核对。
+- 原有回归 62/62、历史查询 6/6、新增延迟测试 3/3 全部通过，另有 Agent 配置检查通过。新增测试通过真实 Miniflare D1 运行时验证参数边界、尖峰/失败/缺口、幂等与循环覆盖、固定槽、24h 分页及访问权限。
+- 完整前端生产构建通过：Vite 转换 84 个模块，静态资源复制和 dashboard.html 生成完成。先前 Codex 内部进程管道限制不再是本机验证的待办项。
+- 用户已确认原三个时间选项的模拟预览符合预期。本次补齐六个时间选项后，两处 Vue SFC 编译、组件挂载交互检查及三项 SQLite 兼容测试通过：两个图表的六个时间范围、顶部双向联动、10m 选中状态、5 分钟滑块、偏移重置、超过 24h 的显示上限及原登录限制均已检查。切换范围不增加新历史接口请求。
+- 用户已再次在普通 Windows 终端完成补齐时间选项后的完整验证：62 项回归、6 项历史查询、3 项新增延迟测试和 Agent 配置检查通过，Miniflare D1 运行时与完整前端生产构建也通过。已核对 2026-10-13 22:16 生成的 ServerDetail-CW30MdN1.js 包含全部六个选项。
+- 2026-10-14 用户已完成试点 VPS 原 Agent 备份，并在现有 D1 新增 latency_detail；截图查询结构已核对。定制 Worker、前端和 Agent 尚未发布，新增功能的真实采集与免费额度验收仍待一台 VPS 的试点。
+
+## GitHub 直连 Cloudflare 构建（2026-10-14）
+
+已通过只读 Git 拉取核对用户 fork 的 main：仍为原始基线 463bb1f9e11218b0e0a87a3672825d2a4ee30449，可直接合入本分支。用户确认构建命令为 npm run build:frontend，部署命令为 npx wrangler deploy，根目录为 /。
+
+Cloudflare 直连构建使用仓库根目录的 wrangler.toml，不运行 GitHub Actions 中的配置生成步骤。该文件明确指定当前 cf-server-monitor 和既有 server-monitor-db 的 database_id，保留原 MetricsBroadcaster 类、v1 迁移、定时任务和 keep_vars。数据库 ID 从用户已提供的 D1 页面核对；它是资源标识，不是 API_SECRET 或访问令牌。试点节点白名单仍在现有 Worker 的 Variables and Secrets 中设置，不写入公开源码。
+
+本轮仅修改部署配置及维护说明；Worker/前端/Agent 运行代码与已经通过完整测试和生产构建的版本相同。配置解析与原绑定、迁移、定时任务的核对通过；不因此重复本机完整验证。

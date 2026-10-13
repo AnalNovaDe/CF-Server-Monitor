@@ -15,7 +15,8 @@
     "test:all": "npm run test && npm run test:agent-config && npm run test:history-query",
     "test:agent-config": "node test/agent-config.js",
     "test:history-query": "node --test test/history-query.test.js",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:latency": "node --test test/latency-detail.test.js"
   },
   "keywords": [
     "cloudflare",
