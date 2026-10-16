@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { buildCustomAgentInstallCommand, CUSTOM_INSTALLER_SHA256, CUSTOM_AGENT_RELEASE } from '../src/frontend/utils/customAgentInstall.js';
+import { buildCustomAgentInstallCommand, CUSTOM_INSTALLER_SHA256, CUSTOM_INSTALLER_RELEASE } from '../src/frontend/utils/customAgentInstall.js';
 import { handleLatencyInstallCheck } from '../src/handlers/latencyDetail.js';
 import { clearServersListCache } from '../src/utils/cache.js';
 import { handleAdminAPI } from '../src/handlers/admin.js';
@@ -20,7 +20,7 @@ test('copy command pins the published installer and quotes server settings liter
   assert.equal(digest(script), CUSTOM_INSTALLER_SHA256);
   const secret = "secret'$(touch /tmp/never-run)`uname`";
   const cmd = buildCustomAgentInstallCommand({ serverId:id, secret, baseUrl:'https://monitor.example/', options:{node_1:'',ct:"host'; exit 7; '",reset_day:1,auto_update:1} });
-  assert.ok(cmd.includes(`${CUSTOM_AGENT_RELEASE}/install-custom-agent.sh`));
+  assert.ok(cmd.includes(`${CUSTOM_INSTALLER_RELEASE}/install-custom-agent.sh`));
   assert.ok(cmd.includes(CUSTOM_INSTALLER_SHA256));
   assert.ok(cmd.includes(shellQuote(`-secret=${secret}`)));
   assert.ok(cmd.includes(shellQuote("-ct=host'; exit 7; '")));
@@ -79,7 +79,7 @@ test('merged admin login accepts Chinese usernames and only authenticated settin
 // Linux CI runs an isolated shell integration test with a fake download, Agent and
 // systemctl. Absolute system paths and binary hashes are mapped to the test fixture;
 // no actual Agent or system service is installed or stopped.
-test('Linux installer checks before mutation, backs up, enables detail and restores on failure', {skip:process.platform!=='linux'?'Linux shell integration runs in GitHub Actions':false}, async () => {
+test('Linux installer enables boot startup and restores files, running state and enablement independently', {skip:process.platform!=='linux'?'Linux shell integration runs in GitHub Actions':false}, async () => {
   const root=await mkdtemp(join(tmpdir(),'cfm-install-test-'));
   try {
     const tools=join(root,'tools'),home=join(root,'home');
@@ -88,10 +88,14 @@ test('Linux installer checks before mutation, backs up, enables detail and resto
     const fakeAgent=await executable('fake-agent',`#!/bin/bash
 set -eu
 if [[ $1 == version ]]; then echo 'CF-Server-Monitor Go Probe 1.0.19-latency.2'; exit; fi
-mkdir -p "$HOME/.cf-probe/bin" "$HOME/.config/systemd/user"
-cp "$0" "$HOME/.cf-probe/bin/cf-probe"
-printf 'SERVER_ID="${id}"\\nSECRET="test-secret"\\nWORKER_URL="https://test/update"\\nLATENCY_DETAIL="0"\\n' > "$HOME/.cf-probe/config.conf"
-echo new-unit > "$HOME/.config/systemd/user/cf-probe.service"
+# The real Agent install stops AND disables the old unit, even with --no-start.
+mode=(); [[ $CFM_TEST_MODE != user ]] || mode=(--user)
+systemctl "\${mode[@]}" stop cf-probe.service
+systemctl "\${mode[@]}" disable cf-probe.service
+mkdir -p "$(dirname "$CFM_TEST_BIN")" "$(dirname "$CFM_TEST_UNIT")" "$(dirname "$CFM_TEST_CONF")"
+cp "$0" "$CFM_TEST_BIN"
+printf 'SERVER_ID="${id}"\\nSECRET="test-secret"\\nWORKER_URL="https://test/update"\\nLATENCY_DETAIL="0"\\nAUTO_UPDATE="1"\\n' > "$CFM_TEST_CONF"
+echo new-unit > "$CFM_TEST_UNIT"
 if [[ \${CFM_TEST_FAIL:-} == install ]]; then exit 7; fi
 `);
     const fakeHash=digest(await readFile(fakeAgent));
@@ -113,41 +117,96 @@ else cp ${shellQuote(fakeAgent)} "$out"; fi
 `);
     await executable('systemctl',`#!/bin/bash
 set -eu
-[[ \${1:-} != --user ]] || shift
+if [[ $CFM_TEST_MODE == user ]]; then [[ \${1:-} == --user ]]; shift
+else [[ \${1:-} != --user ]]; fi
 case "$1" in
-show-environment|daemon-reload|enable|disable) exit 0;;
-show) [[ \${*: -1} != --value ]] || { [[ ! -f "$HOME/.config/systemd/user/cf-probe.service" ]] || echo "$HOME/.config/systemd/user/cf-probe.service"; }; exit 0;;
-is-active|is-enabled) [[ $(cat "$HOME/service-state" 2>/dev/null) == active ]];;
+show-environment|daemon-reload) exit 0;;
+show)
+  if [[ \${*: -1} == --value ]]; then
+    [[ ! -f $CFM_TEST_UNIT ]] || echo "$CFM_TEST_UNIT"
+  else
+    printf 'ActiveState=%s\\nMainPID=1\\nUnitFileState=%s\\n' "$(cat "$HOME/service-state")" "$(cat "$HOME/enable-state")"
+  fi
+  exit 0;;
+enable)
+  if [[ \${CFM_TEST_FAIL:-} == enable || \${CFM_TEST_FAIL:-} == enable-noop ]] && [[ ! -e "$HOME/enable-failure-used" ]]; then
+    touch "$HOME/enable-failure-used"
+    [[ $CFM_TEST_FAIL == enable-noop ]] && exit 0
+    exit 9
+  fi
+  echo enabled > "$HOME/enable-state";;
+disable) echo disabled > "$HOME/enable-state";;
+is-active) [[ $(cat "$HOME/service-state" 2>/dev/null) == active ]];;
+is-enabled) [[ $(cat "$HOME/enable-state" 2>/dev/null) == enabled ]];;
 stop) echo inactive > "$HOME/service-state";;
 start) echo active > "$HOME/service-state";;
 esac
 `);
-    let script=(await readFile(installerURL,'utf8')).replaceAll('\r\n','\n');
-    script=script.replace('-d /run/systemd/system',`-d ${shellQuote(root)}`).replace('if [[ $EUID -eq 0 ]]; then','if false; then')
-      .replaceAll('/etc/config/cf-probe/config.conf',join(root,'unused-system-config'))
-      .replaceAll(/(?:f6986f1a33ec7d7ce69215c6768e74c704317a777f2ebc1983d129b4e6835aae|dccc28a3f6eaab789d7484992520f2930e5862cc62de216710407c1ff02d4f14)/g,fakeHash);
-    const file=join(root,'install.sh');await writeFile(file,script);
-    const env={...process.env,HOME:home,PATH:`${tools}:${process.env.PATH}`};
-    const args=[file,`-id=${id}`,'-secret=test-secret','-url=https://test/update'];
-    let result=spawnSync('bash',['-n',file],{env,encoding:'utf8'});
-    assert.equal(result.status,0,result.stderr);
-    result=spawnSync('bash',args,{env:{...env,CFM_TEST_STATUS:'403'},encoding:'utf8'});
-    assert.notEqual(result.status,0);
-    await assert.rejects(readFile(join(home,'.cf-probe/config.conf')));
-    result=spawnSync('bash',args,{env:{...env,CFM_TEST_HTML:'1'},encoding:'utf8'});
-    assert.notEqual(result.status,0);
-    await assert.rejects(readFile(join(home,'.cf-probe/config.conf')));
-    result=spawnSync('bash',args,{env,encoding:'utf8'});
-    assert.equal(result.status,0,result.stderr);
-    const conf=join(home,'.cf-probe/config.conf'),binary=join(home,'.cf-probe/bin/cf-probe'),unit=join(home,'.config/systemd/user/cf-probe.service');
-    const original=await Promise.all([conf,binary,unit].map(path=>readFile(path)));
-    assert.match(original[0].toString(),/LATENCY_DETAIL="1"/);
-    assert.match(original[0].toString(),/AUTO_UPDATE="0"/);
-    result=spawnSync('bash',args,{env:{...env,CFM_TEST_FAIL:'install'},encoding:'utf8'});
-    assert.notEqual(result.status,0);
-    const restored=await Promise.all([conf,binary,unit].map(path=>readFile(path)));
-    assert.deepEqual(restored,original);
-    assert.equal((await readFile(join(home,'service-state'),'utf8')).trim(),'active');
-    assert.match(result.stderr,/Restore result=1/);
+    for (const mode of ['user','system']) {
+      const modeHome=join(home,mode);await mkdir(modeHome);
+      const conf=mode==='user'?join(modeHome,'.cf-probe/config.conf'):join(modeHome,'etc/config.conf');
+      const binary=mode==='user'?join(modeHome,'.cf-probe/bin/cf-probe'):join(modeHome,'bin/cf-probe');
+      const unit=mode==='user'?join(modeHome,'.config/systemd/user/cf-probe.service'):join(modeHome,'systemd/cf-probe.service');
+      let script=(await readFile(installerURL,'utf8')).replaceAll('\r\n','\n');
+      script=script.replace('-d /run/systemd/system',`-d ${shellQuote(root)}`)
+        .replace('if [[ $EUID -eq 0 ]]; then',`if ${mode==='system'?'true':'false'}; then`)
+        .replaceAll('/home/cfsm/.cf-probe/config.conf',join(root,'unused-cfsm-config'))
+        .replaceAll('/etc/config/cf-probe/config.conf',mode==='system'?conf:join(root,'unused-system-config'))
+        .replaceAll('/usr/local/bin/cf-probe',binary)
+        .replaceAll('/etc/systemd/system/cf-probe.service',unit)
+        .replaceAll(/(?:f6986f1a33ec7d7ce69215c6768e74c704317a777f2ebc1983d129b4e6835aae|dccc28a3f6eaab789d7484992520f2930e5862cc62de216710407c1ff02d4f14)/g,fakeHash);
+      const file=join(modeHome,'install.sh');await writeFile(file,script);
+      const env={...process.env,HOME:modeHome,PATH:`${tools}:${process.env.PATH}`,CFM_TEST_MODE:mode,CFM_TEST_CONF:conf,CFM_TEST_BIN:binary,CFM_TEST_UNIT:unit};
+      const args=[file,`-id=${id}`,'-secret=test-secret','-url=https://test/update'];
+      const run=(extra={})=>spawnSync('bash',args,{env:{...env,...extra},encoding:'utf8'});
+      const state=async name=>(await readFile(join(modeHome,name),'utf8')).trim();
+      let result=spawnSync('bash',['-n',file],{env,encoding:'utf8'});
+      assert.equal(result.status,0,result.stderr);
+      for (const failure of [{CFM_TEST_STATUS:'403'},{CFM_TEST_HTML:'1'}]) {
+        result=run(failure);assert.notEqual(result.status,0);
+        await assert.rejects(readFile(conf));
+        await assert.rejects(readFile(join(modeHome,'service-state')));
+      }
+      // A failed first install must remove its newly created files and leave no autostart.
+      result=run({CFM_TEST_FAIL:'enable'});assert.notEqual(result.status,0);
+      for (const path of [conf,binary,unit]) await assert.rejects(readFile(path));
+      assert.equal(await state('service-state'),'inactive');
+      assert.equal(await state('enable-state'),'disabled');
+      assert.match(result.stderr,/Restore result=1/);
+      await rm(join(modeHome,'enable-failure-used'));
+
+      // Both fresh install and replacement must undo the real Agent's disable step.
+      for (let pass=0;pass<2;pass++) {
+        result=run();assert.equal(result.status,0,result.stderr);
+        assert.equal(await state('service-state'),'active');
+        assert.equal(await state('enable-state'),'enabled');
+        assert.match(result.stdout,/UnitFileState=enabled/);
+      }
+      const original=await Promise.all([conf,binary,unit].map(path=>readFile(path)));
+      assert.match(original[0].toString(),/LATENCY_DETAIL="1"/);
+      assert.match(original[0].toString(),/AUTO_UPDATE="0"/);
+      // Failure recovery preserves all four combinations, rather than treating
+      // "running" and "enabled at boot" as the same state.
+      for (const active of ['active','inactive']) for (const enabled of ['enabled','disabled']) {
+        await writeFile(join(modeHome,'service-state'),active);
+        await writeFile(join(modeHome,'enable-state'),enabled);
+        result=run({CFM_TEST_FAIL:'install'});assert.notEqual(result.status,0);
+        assert.deepEqual(await Promise.all([conf,binary,unit].map(path=>readFile(path))),original);
+        assert.equal(await state('service-state'),active);
+        assert.equal(await state('enable-state'),enabled);
+        assert.match(result.stderr,/Restore result=1/);
+      }
+      // An explicit enable failure OR a successful no-op must not claim success.
+      for (const failure of ['enable','enable-noop']) {
+        await writeFile(join(modeHome,'service-state'),'active');
+        await writeFile(join(modeHome,'enable-state'),'enabled');
+        result=run({CFM_TEST_FAIL:failure});assert.notEqual(result.status,0);
+        assert.deepEqual(await Promise.all([conf,binary,unit].map(path=>readFile(path))),original);
+        assert.equal(await state('service-state'),'active');
+        assert.equal(await state('enable-state'),'enabled');
+        assert.match(result.stderr,/Restore result=1/);
+        await rm(join(modeHome,'enable-failure-used'));
+      }
+    }
   } finally { await rm(root,{recursive:true,force:true}); }
 });

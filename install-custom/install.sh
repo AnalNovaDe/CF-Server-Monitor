@@ -102,9 +102,11 @@ chmod 600 "$cfm_stage"
 mv -f -- "$cfm_stage" "$cfm_conf"
 cfm_stage=''
 "${cfm_systemctl[@]}" daemon-reload
+"${cfm_systemctl[@]}" enable cf-probe.service
 "${cfm_systemctl[@]}" start cf-probe.service
 for cfm_attempt in 1 2 3 4 5; do sleep 1; "${cfm_systemctl[@]}" is-active --quiet cf-probe.service; done
+"${cfm_systemctl[@]}" is-enabled --quiet cf-probe.service
 trap - ERR INT TERM
 printf 'Installed: 1.0.19-latency.2. BACKUP_PATH=%s\n' "$cfm_backup"
-"${cfm_systemctl[@]}" show cf-probe.service -p ActiveState -p MainPID
+"${cfm_systemctl[@]}" show cf-probe.service -p ActiveState -p MainPID -p UnitFileState
 printf 'LATENCY_DETAIL=1 AUTO_UPDATE=0. Verify new history after 2-3 minutes and review free usage.\n'
