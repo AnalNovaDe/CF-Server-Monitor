@@ -9,8 +9,11 @@ export function mergeLatencySamples(previous, incoming, now = Date.now()) {
 
 // Five-minute *attempt* failure rate, never count missing measurements as losses.
 export function latencySeries(samples, index) {
+  return seriesForRows(samples.filter(s => s.p === index));
+}
+
+function seriesForRows(rows) {
   const ping = [], loss = [], failures = [];
-  const rows = samples.filter(s => s.p === index);
   let start = 0, lost = 0, previous;
   for (let i = 0; i < rows.length; i++) {
     const s = rows[i];
@@ -26,4 +29,25 @@ export function latencySeries(samples, index) {
     previous = s;
   }
   return { ping, loss, failures };
+}
+
+// Keep the 5-minute failure-rate context, but only give the chart the selected range.
+// Group once, rather than filtering all 24h eight times on every interaction.
+export function latencyChartSeries(samples, start, end) {
+  const routes = new Map();
+  for (const sample of samples) {
+    if (sample.t < start - 300000 || sample.t > end) continue;
+    if (!routes.has(sample.p)) routes.set(sample.p, []);
+    routes.get(sample.p).push(sample);
+  }
+  return new Map([...routes].map(([index, rows]) => {
+    const series = seriesForRows(rows);
+    const clip = points => {
+      const first = points.findIndex(point => point.x >= start);
+      if (first < 0) return [];
+      // Retain one preceding point so clipping does not change a boundary segment.
+      return points.slice(Math.max(0, first - 1));
+    };
+    return [index, { ping: clip(series.ping), loss: clip(series.loss), failures: series.failures.filter(point => point.x >= start) }];
+  }));
 }

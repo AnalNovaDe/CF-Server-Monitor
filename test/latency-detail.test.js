@@ -90,6 +90,24 @@ test(`${process.env.LATENCY_TEST_SQLITE ? 'SQLite compatibility' : 'D1 runtime'}
    assert.ok(pages<=8);
   }
   assert.equal(pages,8);assert.equal(merged.length,10);
+  // Newest-first uses the same bounded pages and visits the entire ring exactly once.
+  let before=0, backwardsPages=0, reverseSamples=[], covered=0;
+  while(true) {
+   const body=await (await handleLatencyHistory(new Request(`https://test/api/history/latency?id=detail-test-node&before=${before}`),env,{is_public:'true'},{})).json();
+   assert.ok(body.range_to-body.range_from<=180*MINUTE);
+   if(backwardsPages===0)assert.deepEqual(body.samples.slice(-2),samples);
+   else assert.equal(body.range_to,before);
+   assert.equal(body.next_before,body.range_from);
+   covered+=(body.range_to-body.range_from)/MINUTE;
+   reverseSamples.push(...body.samples);backwardsPages++;
+   if(!body.has_previous)break;
+   assert.ok(body.next_before<before || before===0);before=body.next_before;
+   assert.ok(backwardsPages<=8);
+  }
+  assert.equal(backwardsPages,8);assert.equal(covered,1440);assert.equal(reverseSamples.length,10);
+  assert.equal(new Set(reverseSamples.map(s=>`${s.p}:${s.t}`)).size,10);
+  assert.equal((await handleLatencyHistory(new Request('https://test/api/history/latency?id=detail-test-node&before=nope'),env,{is_public:'true'},{})).status,400);
+  assert.equal((await handleLatencyHistory(new Request('https://test/api/history/latency?id=detail-hidden-node&before=0'),env,{is_public:'true'},{})).status,404);
   // Slots are fixed even after the roster replaces a UUID.
   const replacementMinute=oldest+SLOTS;
   await db.prepare(BLOCK_SQL).bind(0,oldest%SLOTS,'replacement-node',replacementMinute,'[]').run();

@@ -94,11 +94,18 @@ export async function handleLatencyHistory(request, env, sys, ctx) {
   if (serverSlot < 0) return json({ enabled: false, samples: [] });
   const now = Date.now(), latest = Math.floor(now / MINUTE) - 1;
   const after = Number(url.searchParams.get('after') || 0);
-  if (!Number.isSafeInteger(after) || after < 0 || after > now) return json({ error: 'Invalid cursor' }, 400);
-  const first = Math.max(latest - SLOTS + 1, Math.min(latest, Math.floor(after / MINUTE)));
-  const last = Math.min(latest, first + 179); // cap parsing/serialization CPU per Free-plan request
+  const backwards = url.searchParams.has('before');
+  const before = Number(url.searchParams.get('before') || 0);
+  if (![after, before].every(n => Number.isSafeInteger(n) && n >= 0 && n <= now)) return json({ error: 'Invalid cursor' }, 400);
+  const earliest = latest - SLOTS + 1;
+  // before=0 starts at the newest closed minute. Subsequent cursors are exclusive.
+  // Keep the existing forward protocol and the 180-minute CPU/read bound.
+  const last = backwards
+    ? Math.max(earliest, Math.min(latest, before ? Math.floor(before / MINUTE) - 1 : latest))
+    : Math.min(latest, Math.max(earliest, Math.floor(after / MINUTE)) + 179);
+  const first = backwards ? Math.max(earliest, last - 179) : Math.max(earliest, Math.min(latest, Math.floor(after / MINUTE)));
   // Auth is checked BEFORE cache access. Coarsen cursors to minute boundaries.
-  const cacheKey = new Request(`${url.origin}/__latency_cache/v1/${serverSlot}/${encodeURIComponent(id)}/${first}/${last}`);
+  const cacheKey = new Request(`${url.origin}/__latency_cache/v2/${serverSlot}/${encodeURIComponent(id)}/${first}/${last}`);
   const cache = globalThis.caches?.default;
   const cached = await cache?.match(cacheKey);
   if (cached) {
@@ -115,7 +122,9 @@ export async function handleLatencyHistory(request, env, sys, ctx) {
     // Cursor follows persisted records, never wall time: delayed uploads remain visible.
     const cursor = samples.length ? Math.max(after, ...samples.map(s => s.t)) : after;
     const body = { enabled: true, interval_seconds: 20, retention_hours: 24, cursor,
-      next_after: (last + 1) * MINUTE, has_more: last < latest, as_of: (latest + 1) * MINUTE, samples };
+      next_after: (last + 1) * MINUTE, has_more: last < latest, as_of: (latest + 1) * MINUTE,
+      range_from: first * MINUTE, range_to: (last + 1) * MINUTE,
+      next_before: first * MINUTE, has_previous: first > earliest, samples };
     const response = json(body);
     if (cache && ctx?.waitUntil) {
       const headers = new Headers(response.headers);

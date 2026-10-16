@@ -326,7 +326,7 @@
         </div>
       </div>
 
-      <LatencyDetailCharts :key="serverId + apiIndex" :server-id="serverId" :api-index="apiIndex" :labels="denseLatencyLabels" :selected-hours="denseLatencyHours" @update:selected-hours="setTimeRange" @active="denseLatencyActive = $event" />
+      <LatencyDetailCharts :key="serverId + apiIndex" :server-id="serverId" :api-index="apiIndex" :labels="denseLatencyLabels" :selected-hours="denseLatencyHours" :probe-mode="server.ping_mode || 'tcp'" @update:selected-hours="setTimeRange" @active="denseLatencyActive = $event" />
       <div class="chart-card" :class="{ 'full-width': isChartExpanded('ping') }" v-show="hasPingData && !denseLatencyActive">
         <div class="chart-card-header">
           <span class="chart-title">
