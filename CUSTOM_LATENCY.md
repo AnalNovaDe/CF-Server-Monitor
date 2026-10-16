@@ -127,3 +127,13 @@ Cloudflare 直连构建使用仓库根目录的 wrangler.toml，不运行 GitHub
 命令先校验安装脚本，再由脚本校验二进制 SHA256 和版本。一次 POST /update/latency-check 使用原 API_SECRET，核对节点、白名单和已有数据表，仅读取、不写样本；它不是自动免费额度审计。安装脚本备份原二进制、配置和服务文件，停止旧探针后安装，写入 LATENCY_DETAIL=1 与 AUTO_UPDATE=0，再启动服务；失败时尝试恢复备份与原运行状态并输出备份路径。安装成功仍须核对真实上传。程序与校验文件下载由 GitHub 提供，不通过 Worker/D1 中转。正常采集频率不变，新增一次安装前检查请求，启用其它节点后会相应增加其每分钟原始记录上传和存储用量。
 
 本地定向验证已覆盖命令转义、脚本哈希、安装检查鉴权/节点上限/缺表、管理员中文登录、白名单仅向管理员返回，以及既有图表交互与 SQLite 兼容。Linux 隔离安装/回退测试在 Windows 跳过，已接入 test:latency，需在现有 GitHub Actions 的 Ubuntu 作业运行。助手环境的 workerd/esbuild 受 spawn EPERM 限制，不能把本地合并或这些定向检查称作完整构建与真实安装验收。发布前先运行普通终端完整验证，安装命令使用前确认 Ubuntu 检查通过。
+
+## 安装脚本开机自启修复（2026-10-16）
+
+初版包装脚本使用 Agent install --no-start，然后单独启动服务。Agent 的安装流程先停止并禁用旧服务，而包装脚本漏了恢复 enable，因此安装后服务即使正在运行，下次重启也可能不启动。先前 Linux 测试替身没有模拟 Agent 的 disable 步骤，并把运行和自启状态混为一项，漏检了此问题。
+
+修订脚本在 daemon-reload 后明确 enable，再 start，核对五次运行状态及 is-enabled，成功摘要同时打印 UnitFileState。enable 失败或未实际生效会触发原备份恢复。Linux 测试分别模拟用户服务和系统服务，覆盖首次安装、替换安装、enable 失败/空操作，以及原运行/自启状态的四种组合；测试不操作真实系统服务。Windows 会明确跳过这些 Linux 场景，发布前须在现有 Ubuntu CI 通过。
+
+安装脚本单独发布到固定 tag agent-installer-1.0.1，附件为 install-custom-agent.sh 和 SHA256SUMS.txt；复制命令固定该 tag 和新的脚本 SHA256。脚本仍从原 agent-1.0.19-latency.2 下载相同二进制，Agent 版本、采集配置与数据库不变。旧 Release 及其脚本校验值保持原样，避免覆盖已经发出的固定下载地址。应先发布并校验新脚本附件，再部署更新后的复制命令。
+
+已安装的节点可以由原安装用户运行 systemctl [--user] enable --now cf-probe.service 恢复自启，随后核对 ActiveState、UnitFileState、LATENCY_DETAIL 和 AUTO_UPDATE；不需要重复下载或重装 Agent。其它节点的扩展仍需另行核对实际历史和免费用量。
