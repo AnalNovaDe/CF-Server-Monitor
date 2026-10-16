@@ -255,6 +255,7 @@
         :show="showCopyModal"
         :current-server-name="currentServerName"
         :target-os="targetOs"
+        :server-id="copyServerId"
         :install-mode="installMode"
         :install-gh-proxy="installGhProxy"
         :install-version="installVersion"
@@ -278,12 +279,16 @@
         :auto-update="autoUpdate"
         :install-command="getCustomInstallCommand()"
         :copied-cmd="copiedCmd"
+        :custom-agent="customAgent"
+        :custom-agent-eligible="customAgentEligible"
+        :custom-agent-version="CUSTOM_AGENT_VERSION"
         @close="closeCopyModal"
         @copy-cmd="copyCustomCmd"
         @update:target-os="targetOs = $event"
         @update:install-mode="installMode = $event"
         @update:install-gh-proxy="installGhProxy = $event"
         @update:install-version="installVersion = $event"
+        @update:custom-agent="customAgent = $event"
         @open-edit-from-copy="openEditModalFromCopy"
       />
 
@@ -589,6 +594,7 @@ import CopyCommandModal from './components/CopyCommandModal.vue'
 import { adminApi, login, logout as apiLogout, upgradeDatabase, clearHistory, fetchConfig } from '../../utils/api'
 import { hasMultipleApiBases, getApiBases } from '../../utils/config.js'
 import { copyTextToClipboard } from '../../utils/clipboard.js'
+import { buildCustomAgentInstallCommand, CUSTOM_AGENT_VERSION } from '../../utils/customAgentInstall.js'
 import { t, useTranslation } from '../../utils/i18n'
 import { PING_NODE_FIELDS, validatePingNode } from '../../utils/pingNode.js'
 import { normalizeDisplayMode, resolveDisplayMode } from '../../utils/displayMode.js'
@@ -819,7 +825,12 @@ const normalizePreferredThemeSetting = (value) => {
 
 const normalizeDefaultLanguageSetting = (value) => {
   const language = String(value || '').trim().toLowerCase()
-  return ['zh', 'en', 'auto'].includes(language) ? language : 'auto'
+  return ['zh', 'en', 'es', 'auto'].includes(language) ? language : 'auto'
+}
+
+const normalizeNotificationLanguageSetting = (value) => {
+  const language = String(value || '').trim().toLowerCase()
+  return ['zh', 'en', 'es'].includes(language) ? language : 'zh'
 }
 
 const formatThemeOptions = (value) => {
@@ -944,6 +955,7 @@ const settings = ref({
   tg_bot_token: '',
   tg_chat_id: '',
   notification_timezone: 'UTC',
+  notification_language: 'zh',
   expire_notification_time: '12',
   notification_webhook_enabled: false,
   notification_webhook_url: '',
@@ -976,6 +988,7 @@ const settings = ref({
   csp_api: ''
 })
 const apiSecret = ref('')
+const latencyDetailServerIds = ref([])
 const changeAdminPassword = ref(false)
 
 const clearAdminPasswordInputs = () => {
@@ -1116,6 +1129,8 @@ const targetOs = ref('linux')
 const installMode = ref('current-user')
 const installGhProxy = ref('')
 const installVersion = ref('')
+const customAgent = ref(false)
+const customAgentEligible = computed(() => latencyDetailServerIds.value.includes(copyServerId.value))
 const collectInterval = ref(0)
 const reportInterval = ref(60)
 const wssReportInterval = ref(2)
@@ -1353,6 +1368,7 @@ const loadLatestAgentVersion = async () => {
 }
 
 const loadSettings = async () => {
+  latencyDetailServerIds.value = []
   try {
     const result = await adminApiForSite({ action: 'get_settings' })
     if (!result.error) {
@@ -1385,6 +1401,7 @@ const loadSettings = async () => {
         tg_bot_token: settingsData.tg_bot_token || '',
         tg_chat_id: settingsData.tg_chat_id || '',
         notification_timezone: normalizeNotificationTimezoneSetting(settingsData.notification_timezone),
+        notification_language: normalizeNotificationLanguageSetting(settingsData.notification_language),
         expire_notification_time: normalizeExpireNotificationTimeSetting(settingsData.expire_notification_time),
         notification_webhook_enabled: settingsData.notification_webhook_enabled === 'true' || settingsData.notification_webhook_enabled === true,
         notification_webhook_url: settingsData.notification_webhook_url || '',
@@ -1421,6 +1438,7 @@ const loadSettings = async () => {
       applyMikusThemeOptions(settingsData.theme_options)
       changeAdminPassword.value = !settings.value.password_configured || !String(settings.value.username || '').trim()
       apiSecret.value = data.api_secret || ''
+      latencyDetailServerIds.value = Array.isArray(data.latency_detail_server_ids) ? data.latency_detail_server_ids : []
     }
   } catch (e) {
     console.error('[ERROR] Load settings failed:', e)
@@ -1582,6 +1600,7 @@ const saveSettings = async () => {
       tg_bot_token: settings.value.tg_bot_token,
       tg_chat_id: settings.value.tg_chat_id,
       notification_timezone: normalizeNotificationTimezoneSetting(settings.value.notification_timezone),
+      notification_language: normalizeNotificationLanguageSetting(settings.value.notification_language),
       expire_notification_time: normalizeExpireNotificationTimeSetting(settings.value.expire_notification_time),
       notification_webhook_enabled: settings.value.notification_webhook_enabled ? 'true' : 'false',
       notification_webhook_url: settings.value.notification_webhook_url,
@@ -1732,6 +1751,8 @@ const copyCmd = (serverId) => {
   installMode.value = 'current-user'
   installGhProxy.value = ''
   installVersion.value = ''
+  customAgent.value = latencyDetailServerIds.value.includes(serverId)
+  if (customAgent.value) installMode.value = 'cfsm-user'
   collectInterval.value = server?.collect_interval ?? 0
   reportInterval.value = server?.report_interval || 60
   wssReportInterval.value = server?.wss_report_interval || 2
@@ -1840,6 +1861,26 @@ const buildInstallAsCfsmCommand = (command, runStep) => {
 
 const getCustomInstallCommand = () => {
   const HOST = selectedApiBase.value
+  if (customAgent.value) {
+    if (!customAgentEligible.value || targetOs.value !== 'linux') return ''
+    const options = {
+      collect_interval: collectInterval.value, interval: reportInterval.value,
+      connection_mode: getEffectiveConnectionMode(connectionMode.value),
+      ping_mode: getEffectivePingMode(installMode.value === 'cfsm-user' ? 'tcp' : pingMode.value),
+      reset_day: resetDay.value ?? 1
+    }
+    for (const [key, value, field] of [
+      ['ct', customCt.value, 'custom_ct'], ['cu', customCu.value, 'custom_cu'],
+      ['cm', customCm.value, 'custom_cm'], ['bd', customBd.value, 'custom_bd'],
+      ['node_1', node1.value, 'node_1'], ['node_2', node2.value, 'node_2'],
+      ['node_3', node3.value, 'node_3'], ['node_4', node4.value, 'node_4']
+    ]) if (value || explicitEmptyNodes.value[field]) options[key] = value
+    if (networkInterface.value) options.interface = networkInterface.value
+    if (hasCorrectionValue(rxCorrection.value)) options.rx_correction = rxCorrection.value
+    if (hasCorrectionValue(txCorrection.value)) options.tx_correction = txCorrection.value
+    const command = buildCustomAgentInstallCommand({ serverId: copyServerId.value, secret: apiSecret.value, baseUrl: HOST, options })
+    return command && installMode.value === 'cfsm-user' ? buildInstallAsCfsmCommand(command, trans.value.nonRootInstallRunStep) : command
+  }
   const autoUpdateFlag = autoUpdate.value ? 1 : 0
   const proxy = installGhProxy.value.trim()
   const version = installVersion.value.trim()
@@ -1915,6 +1956,7 @@ const getCustomInstallCommand = () => {
 
 const copyCustomCmd = async () => {
   const cmd = getCustomInstallCommand()
+  if (!cmd) return
   const copied = await copyTextToClipboard(cmd)
   if (!copied) {
     alertMessage.value = trans.value.httpsRequired
@@ -2473,6 +2515,7 @@ const sendTestNotification = async () => {
       notification_webhook_body: settings.value.notification_webhook_body,
       notification_template: settings.value.notification_template,
       notification_timezone: normalizeNotificationTimezoneSetting(settings.value.notification_timezone),
+      notification_language: normalizeNotificationLanguageSetting(settings.value.notification_language),
       expire_notification_time: normalizeExpireNotificationTimeSetting(settings.value.expire_notification_time)
     })
     if (!result.error) {

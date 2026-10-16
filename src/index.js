@@ -1,4 +1,4 @@
-import { handleLatencyUpload, handleLatencyHistory } from './handlers/latencyDetail.js';
+import { handleLatencyUpload, handleLatencyHistory, handleLatencyInstallCheck } from './handlers/latencyDetail.js';
 import { initDatabase, weeklyCleanup, getMetricsHistory, clearHistory } from './database/schema.js';
 import { checkOfflineNodes, checkExpiringServers, checkResourceAlerts } from './services/notification.js';
 import { updateDatabase } from './database/updateDatabase.js';
@@ -281,6 +281,7 @@ export default {
     const routes = [
       { method: 'POST', path: '/update/latency', handler: () => handleLatencyUpload(request, env) },
       { method: 'GET', path: '/api/history/latency', handler: async () => handleLatencyHistory(request, env, await ensureSiteSettings(), ctx) },
+      { method: 'POST', path: '/update/latency-check', handler: () => handleLatencyInstallCheck(request, env) },
       { method: 'POST', path: '/update', handler: () => handleUpdate(request, env, ctx) },
       { method: 'GET', path: '/update', handler: () => handleUpdateWebSocketUpgrade(request, env) },
       { method: 'GET', path: '/__do/health', handler: async () => {
@@ -485,7 +486,7 @@ export default {
         await checkOfflineNodes(env.DB);
         debug('[Cron] 离线节点检测完成');
         debug('[Cron] 开始执行资源负载告警检测');
-        await checkResourceAlerts(env);
+        await checkResourceAlerts(env, { minute });
         debug('[Cron] 资源负载告警检测完成');
       }
     } else if (cron === '0 * * * *') {
