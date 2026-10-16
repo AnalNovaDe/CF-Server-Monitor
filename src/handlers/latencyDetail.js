@@ -78,6 +78,20 @@ export async function handleLatencyUpload(request, env) {
   }
 }
 
+// A one-time, authenticated check before installation; never writes a minute block.
+export async function handleLatencyInstallCheck(request, env) {
+  if (!env.API_SECRET || request.headers.get('Authorization') !== `Bearer ${env.API_SECRET}`) return json({ error: 'Unauthorized' }, 401);
+  let data;
+  try { data = await boundedJSON(request); } catch { return json({ error: 'Invalid payload' }, 400); }
+  if (!data || typeof data.id !== 'string') return json({ error: 'Invalid server ID' }, 400);
+  if (!detailNodes(env).includes(data.id)) return json({ error: 'Latency detail is not enabled for this node' }, 403);
+  if (!await getServerDetail(env.DB, data.id, true)) return json({ error: 'Not found' }, 404);
+  try {
+    await env.DB.prepare('SELECT server_slot FROM latency_detail LIMIT 0').all();
+    return json({ enabled: true, version: '1.0.19-latency.2' });
+  } catch { return json({ error: 'Latency storage unavailable; check migration and D1 usage' }, 503); }
+}
+
 // Primary-key ranges, not a scan of the resource history tables.
 export function slotRanges(first, last) {
   if (last - first + 1 >= SLOTS) return [[0, SLOTS - 1]];

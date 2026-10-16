@@ -6,6 +6,16 @@
         <button class="modal-close" @click="$emit('close')">✕</button>
       </div>
 
+      <div class="form-group">
+        <label class="form-label">
+          <input type="checkbox" :checked="customAgent" :disabled="!customAgentEligible" @change="$emit('update:custom-agent', $event.target.checked)">
+          {{ customAgentText.title }}
+        </label>
+        <p class="text-secondary text-sm">{{ customAgentEligible ? customAgentText.ready : customAgentText.disabled }}</p>
+        <p v-if="customAgent && targetOs !== 'linux'" class="text-secondary text-sm">{{ customAgentText.unsupported }}</p>
+        <label class="form-label">{{ customAgentText.serverId }}</label>
+        <input class="form-input" readonly :value="serverId" :aria-label="customAgentText.serverId" @focus="$event.target.select()">
+      </div>
       <div class="form-row">
         <div class="form-group flex-1">
           <label class="form-label">{{ trans.targetOs }}</label>
@@ -25,7 +35,8 @@
           </label>
           <input
             type="text"
-            :value="installVersion"
+            :value="customAgent ? customAgentVersion : installVersion"
+            :disabled="customAgent"
             class="form-input"
             :placeholder="targetOs === 'docker' ? 'latest' : trans.installVersionPlaceholder"
             @input="$emit('update:install-version', $event.target.value)"
@@ -50,7 +61,7 @@
             {{ trans.ghProxy }}
             <HelpTooltip :text="trans.ghProxyTip" />
           </label>
-          <select v-model="selectedGhProxy" class="form-select">
+          <select v-model="selectedGhProxy" class="form-select" :disabled="customAgent">
             <option v-for="option in ghProxyOptions" :key="option.value" :value="option.value">{{ option.label }}</option>
             <option :value="CUSTOM_GH_PROXY_VALUE">{{ trans.custom || 'Custom' }}</option>
           </select>
@@ -93,8 +104,8 @@
         <div class="config-row">
           <span class="config-label">{{ trans.autoUpdate }}</span>
           <span class="config-value">
-            <span :class="['config-badge', autoUpdate ? 'is-enabled' : 'is-disabled']">
-              {{ autoUpdate ? trans.enabled : trans.disabled }}
+            <span :class="['config-badge', autoUpdate && !customAgent ? 'is-enabled' : 'is-disabled']">
+              {{ autoUpdate && !customAgent ? trans.enabled : trans.disabled }}
             </span>
           </span>
         </div>
@@ -141,7 +152,7 @@
 
       <div class="modal-footer flex-justify-between">
         <div class="flex items-center gap-2">
-          <button @click="$emit('copy-cmd')" class="btn btn-primary">{{ copiedCmd ? '✅ ' + trans.copied : '📋 ' + trans.copy }}</button> <button @click="$emit('open-edit-from-copy')" class="btn btn-blue">✏️ {{ trans.edit }}</button>
+          <button @click="$emit('copy-cmd')" class="btn btn-primary" :disabled="!installCommand">{{ copiedCmd ? '✅ ' + trans.copied : '📋 ' + trans.copy }}</button> <button @click="$emit('open-edit-from-copy')" class="btn btn-blue">✏️ {{ trans.edit }}</button>
         </div>
         <button @click="$emit('close')" class="btn">{{ trans.cancel }}</button>
       </div>
@@ -152,12 +163,14 @@
 <script setup>
 import { computed, ref, watch } from 'vue'
 import HelpTooltip from '../../../components/HelpTooltip.vue'
+import { currentLang } from '../../../utils/i18n'
 
 const props = defineProps({
   trans: { type: Object, required: true },
   settings: { type: Object, default: () => ({}) },
   show: { type: Boolean, default: false },
   currentServerName: { type: String, default: '' },
+  serverId: { type: String, default: '' },
   targetOs: { type: String, default: 'linux' },
   installMode: { type: String, default: 'current-user' },
   installGhProxy: { type: String, default: '' },
@@ -178,7 +191,10 @@ const props = defineProps({
   txCorrection: { type: [Number, String], default: '' },
   autoUpdate: { type: Boolean, default: false },
   installCommand: { type: String, default: '' },
-  copiedCmd: { type: Boolean, default: false }
+  copiedCmd: { type: Boolean, default: false },
+  customAgent: { type: Boolean, default: false },
+  customAgentEligible: { type: Boolean, default: false },
+  customAgentVersion: { type: String, default: '' }
 })
 
 const emit = defineEmits([
@@ -188,8 +204,23 @@ const emit = defineEmits([
   'update:target-os',
   'update:install-mode',
   'update:install-gh-proxy',
-  'update:install-version'
+  'update:install-version',
+  'update:custom-agent'
 ])
+
+const customAgentText = computed(() => currentLang.value === 'zh' ? {
+  title: '定制高密度历史探针',
+  serverId: '节点 ID（点击选中，可复制到高密度白名单）',
+  ready: 'Linux systemd · amd64 / arm64 · 自动备份、校验下载、禁用官方自动更新。请保持原安装用户。',
+  disabled: '当前节点未启用高密度记录；核对免费用量后，将节点 ID 追加到 Cloudflare 的 LATENCY_DETAIL_SERVER_IDS（最多六台），再刷新后台。',
+  unsupported: '定制版仅提供 Linux systemd 程序；请选择 Linux，或取消勾选后使用官方探针。'
+} : {
+  title: 'Custom dense-history Agent',
+  serverId: 'Node ID (click to select and copy to the dense-history allowlist)',
+  ready: 'Linux systemd · amd64 / arm64 · Verified download and backup; official auto-update disabled. Keep the original installation user.',
+  disabled: 'This node is not enabled. Review free usage, append its ID to LATENCY_DETAIL_SERVER_IDS in Cloudflare (six nodes maximum), then refresh the admin page.',
+  unsupported: 'The custom release supports Linux systemd only. Select Linux, or uncheck this option to use the official Agent.'
+})
 
 const CUSTOM_GH_PROXY_VALUE = '__custom__'
 const ghProxyOptions = [
