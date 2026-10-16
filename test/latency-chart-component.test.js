@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { parse, compileScript } from '@vue/compiler-sfc';
 import { createRenderer, h, nextTick, ref } from 'vue';
 
-test('mounted charts have independent ranges and history controls while sharing automatic updates', async () => {
+test('mounted charts have independent routes, ranges and history controls while sharing automatic updates', async () => {
   const filename = new URL('../src/frontend/components/LatencyDetailCharts.vue', import.meta.url);
   const { descriptor } = parse(await readFile(filename, 'utf8'), { filename: filename.pathname });
   const vueURL = import.meta.resolve('vue');
@@ -33,9 +33,10 @@ test('mounted charts have independent ranges and history controls while sharing 
     const asOf=Math.floor(clock/60000)*60000,earliest=asOf-86400000;
     const to=q.has('before')?(Number(q.get('before'))||asOf):Math.min(asOf,Number(q.get('after'))+10800000);
     const from=q.has('before')?Math.max(earliest,to-10800000):Math.max(earliest,Number(q.get('after')));
-    const samples=q.has('after')
+    const routeSamples=q.has('after')
       ? Array.from({length:15},(_,i)=>({p:0,t:to-300000+i*20000,r:allFailed||i===14?null:45,k:'0123456789abcdef'}))
       : [{p:0,t:to-20000,r:45,k:'0123456789abcdef'}];
+    const samples=routeSamples.flatMap(sample=>[sample,{...sample,p:1,r:50,k:'fedcba9876543210'}]);
     return {data:{enabled:true,as_of:asOf,range_from:from,range_to:to,next_before:from,has_previous:from>earliest,next_after:to,has_more:to<asOf,samples}};
   } };
   globalThis.document = { hidden: false, body: { classList: { contains: () => true } }, addEventListener: (name,callback) => listeners.set(name,callback), removeEventListener: name => listeners.delete(name) };
@@ -65,14 +66,14 @@ test('mounted charts have independent ranges and history controls while sharing 
   const selectedHours=ref(24),rangeEvents=[];
   try {
     const Component=(await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`)).default;
-    app=renderer.createApp({render:()=>h(Component,{serverId:'ui-node',labels:['测试线路'],selectedHours:selectedHours.value,'onUpdate:selectedHours':value=>{rangeEvents.push(value);selectedHours.value=value;}})});
+    app=renderer.createApp({render:()=>h(Component,{serverId:'ui-node',labels:['测试线路','备用线路'],selectedHours:selectedHours.value,'onUpdate:selectedHours':value=>{rangeEvents.push(value);selectedHours.value=value;}})});
     app.mount(root);
     for(let i=0;i<60&&!text(root).includes('历史尚未加载完整');i++)await settle();
     assert.match(text(root),/历史尚未加载完整/);
     assert.match(text(root),/阴影区域尚未读取/);
     assert.match(text(root),/不能据此判定测量中断/);
     assert.equal(charts.length,2);
-    assert.equal(charts[1].data.datasets.length,1); // one loss line per route; no artificial 100% scatter series
+    assert.equal(charts[1].data.datasets.length,2); // one loss line per route; no artificial 100% scatter series
     assert.ok(charts[1].data.datasets.every(dataset=>dataset.showLine!==false&&dataset.spanGaps===false));
     assert.equal(charts[1].options.scales.y.max,10); // zero loss does not force a 0..100% axis
     assert.doesNotMatch(text(root),/顶部圆点/);
@@ -84,6 +85,17 @@ test('mounted charts have independent ranges and history controls while sharing 
     assert.equal(charts.length,2);
     assert.equal(all().filter(node=>node.type==='input'&&node.props.type==='range').length,0);
     assert.match(text(root),/每分钟自动刷新/);
+    const visibility=()=>charts.map(chart=>chart.data.datasets.map(dataset=>!dataset.hidden));
+    assert.deepEqual(visibility(),[[true,true],[true,true]]);
+    button('测试线路',0).props.onClick();await settle();
+    assert.deepEqual(visibility(),[[false,true],[true,true]]);
+    assert.equal(button('测试线路',0).props['aria-pressed'],false);
+    assert.equal(button('测试线路',1).props['aria-pressed'],true);
+    button('备用线路',1).props.onClick();await settle();
+    assert.deepEqual(visibility(),[[false,true],[true,false]]);
+    assert.equal(button('备用线路',1).props.style.opacity,.4);
+    assert.equal(button('备用线路',0).props.style.opacity,1);
+    assert.equal(queries.length,9); // chart visibility is local and never re-fetches history
     const initialLatency=bounds(0);
     for(const [label,minutes] of [['10M',10],['30M',30],['1H',60],['6H',360],['12H',720],['24H',1440]]) {
       button(label,1).props.onClick();await settle();
@@ -124,6 +136,7 @@ test('mounted charts have independent ranges and history controls while sharing 
     clock+=60000;
     await intervals[0].callback();await settle();
     assert.equal(queries.length,10);
+    assert.deepEqual(visibility(),[[false,true],[true,false]]); // ranges, sliders and automatic refresh retain each chart's choices
     assert.equal(charts[0].options.scales.x.max,reviewEnd);
     assert.equal(charts[1].options.scales.x.max,clock); // loss follows while latency reviews history
     assert.match(text(root),/历史刷新于/);
@@ -161,6 +174,22 @@ test('mounted charts have independent ranges and history controls while sharing 
     assert.equal(charts[0].options.scales.x.max,clock);
     assert.equal(charts[1].data.datasets[0].data.at(-1).y,100); // actual all-failed windows remain 100%
     assert.equal(charts[1].options.scales.y.max,100);
+    button('测试线路',0).props.onClick();await settle();
+    assert.deepEqual(visibility(),[[true,true],[true,false]]);
+    assert.equal(charts[1].options.scales.y.max,100); // latency visibility cannot change the loss axis
+    button('备用线路',1).props.onClick();await settle();
+    button('测试线路',1).props.onClick();await settle();
+    assert.deepEqual(visibility(),[[true,true],[false,true]]);
+    assert.equal(charts[1].options.scales.y.max,10); // only visible loss routes determine its axis
+    assert.equal(button('测试线路',0).props['aria-pressed'],true);
+    assert.equal(button('测试线路',1).props['aria-pressed'],false);
+    button('备用线路',1).props.onClick();await settle();
+    assert.deepEqual(visibility(),[[true,true],[false,false]]); // hiding every route is allowed
+    button('测试线路',1).props.onClick();await settle();
+    button('备用线路',1).props.onClick();await settle();
+    assert.deepEqual(visibility(),[[true,true],[true,true]]);
+    assert.equal(charts[1].options.scales.y.max,100);
+    assert.equal(queries.length,12);
     app.unmount();app=null;
     assert.ok(charts.every(chart=>chart.destroyed));
     assert.ok(intervals[0].cleared);
