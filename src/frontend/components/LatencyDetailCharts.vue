@@ -61,7 +61,7 @@ const lossNote = computed(() => {
   const basis = protocol.value === 'TCP'
     ? (en.value ? 'Fraction of failed TCP connection attempts in the last 5 minutes; this is not a TCP packet retransmission rate.' : '折线：最近 5 分钟已执行 TCP 连接探测的失败比例，并非 TCP 数据包重传率。')
     : (en.value ? 'Fraction of failed ICMP probe attempts in the last 5 minutes, including probe errors.' : '折线：最近 5 分钟已执行 ICMP 探测的失败比例，包含探测错误。')
-  return basis + (en.value ? ' Dots at 100% mark individual failed attempts. Missing measurements remain gaps.' : '顶部圆点：单次探测失败。缺测留空，不按 0% 处理。')
+  return basis + (en.value ? ' Lines connect recorded measurements; missing measurements remain gaps. The vertical scale adapts to visible data, up to 100%.' : '按测量顺序连线；真实缺测仍留空。纵轴随可见数据调整，最高 100%。')
 })
 const hidden = ref([])
 const hours = ref(24), offsetMinutes = ref(0), historyAnchor = ref(null), clock = ref(Date.now()), pingCanvas = ref(null), lossCanvas = ref(null)
@@ -154,17 +154,29 @@ function draw() {
   const dark = !document.body.classList.contains('light')
   const text = dark ? '#ced5df' : '#435063', grid = dark ? '#ffffff18' : '#00000015'
   const end = viewEnd.value, start = viewStart.value
+  let maxLoss = 0
   const options = (isLoss) => ({ responsive:true, maintainAspectRatio:false, animation:false, parsing:false,
-    interaction:{ mode:'nearest',intersect:false }, plugins:{ legend:{display:false}, tooltip:{ callbacks:{ title: items=>items.length ? new Date(items[0].parsed.x).toLocaleString() : '', label:item=> `${item.dataset.label}: ${Number(item.parsed.y).toFixed(isLoss?1:0)}${isLoss?'%':' ms'}${item.raw.attempts ? ` (${item.raw.attempts} attempts)` : ''}` } } },
-    scales:{ x:{ type:'linear',min:start,max:end,grid:{color:grid},ticks:{color:text,maxTicksLimit:8,minRotation:0,maxRotation:0,callback:v=>new Date(v).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})} },y:{min:isLoss?0:undefined,max:isLoss?100:undefined,grid:{color:grid},ticks:{color:text},title:{display:true,text:isLoss?'%':'ms',color:text}} }
+    interaction:{ mode:'nearest',intersect:false }, plugins:{ legend:{display:false}, tooltip:{ callbacks:{ title: items=>items.length ? new Date(items[0].parsed.x).toLocaleString() : '', label:item=> {
+      let label = `${item.dataset.label}: ${Number(item.parsed.y).toFixed(isLoss?1:0)}${isLoss?'%':' ms'}`
+      if (isLoss && item.raw.attempts) {
+        const failed = Math.round(item.parsed.y * item.raw.attempts / 100)
+        label += en.value ? ` (${failed}/${item.raw.attempts} failed)` : `（${item.raw.attempts} 次中失败 ${failed} 次）`
+      }
+      return label
+    } } } },
+    scales:{ x:{ type:'linear',min:start,max:end,grid:{color:grid},ticks:{color:text,maxTicksLimit:8,minRotation:0,maxRotation:0,callback:v=>new Date(v).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})} },y:{min:isLoss?0:undefined,max:isLoss?Math.min(100,Math.max(10,Math.ceil(maxLoss*1.1/5)*5)):undefined,grid:{color:grid},ticks:{color:text},title:{display:true,text:isLoss?'%':'ms',color:text}} }
   })
   const p=[],l=[]
   for (const i of available.value) {
-    const series=chartSeries.value.get(i) || {ping:[],loss:[],failures:[]}
+    const series=chartSeries.value.get(i) || {ping:[],loss:[]}
     const common={label:props.labels[i]||`Node ${i+1}`,borderColor:colors[i],backgroundColor:colors[i],borderWidth:1,pointRadius:0,tension:0,spanGaps:false,hidden:hidden.value.includes(i)}
     p.push({...common,data:series.ping})
-    l.push({...common,data:series.loss})
-    l.push({...common,label:`${common.label} ${en.value?'failed':'单次失败'}`,data:series.failures,showLine:false,pointRadius:2,pointHoverRadius:4})
+    l.push({...common,borderWidth:1.5,data:series.loss})
+    if (!hidden.value.includes(i)) {
+      for (const point of series.loss) {
+        if (point.x >= start && point.x <= end && Number.isFinite(point.y)) maxLoss = Math.max(maxLoss, point.y)
+      }
+    }
   }
   if (!ping) ping=new Chart(pingCanvas.value,{type:'line',data:{datasets:p},options:options(false),plugins:[pendingHistory]})
   else {ping.data.datasets=p;ping.options=options(false);ping.update('none')}

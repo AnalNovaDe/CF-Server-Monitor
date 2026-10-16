@@ -18,7 +18,7 @@ test('mounted charts update automatically; 24H hides the slider and history revi
   }
   const saved = Object.fromEntries(['document', 'MutationObserver', 'requestAnimationFrame', 'cancelAnimationFrame', 'setInterval', 'clearInterval'].map(key => [key, globalThis[key]]));
   const oldNow = Date.now;
-  let clock = Math.floor(1800000000000 / 60000) * 60000, app;
+  let clock = Math.floor(1800000000000 / 60000) * 60000, app, allFailed = false;
   const intervals = [], listeners = new Map(), charts = [], queries = [];
   class FakeChart {
     constructor(canvas, config) { this.canvas=canvas; this.data=config.data; this.options=config.options; charts.push(this); }
@@ -33,8 +33,10 @@ test('mounted charts update automatically; 24H hides the slider and history revi
     const asOf=Math.floor(clock/60000)*60000,earliest=asOf-86400000;
     const to=q.has('before')?(Number(q.get('before'))||asOf):Math.min(asOf,Number(q.get('after'))+10800000);
     const from=q.has('before')?Math.max(earliest,to-10800000):Math.max(earliest,Number(q.get('after')));
-    return {data:{enabled:true,as_of:asOf,range_from:from,range_to:to,next_before:from,has_previous:from>earliest,next_after:to,has_more:to<asOf,
-      samples:[{p:0,t:to-20000,r:45,k:'0123456789abcdef'}]}};
+    const samples=q.has('after')
+      ? Array.from({length:15},(_,i)=>({p:0,t:to-300000+i*20000,r:allFailed||i===14?null:45,k:'0123456789abcdef'}))
+      : [{p:0,t:to-20000,r:45,k:'0123456789abcdef'}];
+    return {data:{enabled:true,as_of:asOf,range_from:from,range_to:to,next_before:from,has_previous:from>earliest,next_after:to,has_more:to<asOf,samples}};
   } };
   globalThis.document = { hidden: false, body: { classList: { contains: () => true } }, addEventListener: (name,callback) => listeners.set(name,callback), removeEventListener: name => listeners.delete(name) };
   globalThis.MutationObserver = class { observe() {} disconnect() {} };
@@ -65,6 +67,10 @@ test('mounted charts update automatically; 24H hides the slider and history revi
     assert.match(text(root),/阴影区域尚未读取/);
     assert.match(text(root),/不能据此判定测量中断/);
     assert.equal(charts.length,2);
+    assert.equal(charts[1].data.datasets.length,1); // one loss line per route; no artificial 100% scatter series
+    assert.ok(charts[1].data.datasets.every(dataset=>dataset.showLine!==false&&dataset.spanGaps===false));
+    assert.equal(charts[1].options.scales.y.max,10); // zero loss does not force a 0..100% axis
+    assert.doesNotMatch(text(root),/顶部圆点/);
     assert.equal(charts[0].data.datasets[0].data.filter(point=>point.y!==null).length,2);
     button('继续加载').props.onClick();
     for(let i=0;i<60&&!text(root).includes('最近 24h 历史已读取完整');i++)await settle();
@@ -93,17 +99,23 @@ test('mounted charts update automatically; 24H hides the slider and history revi
     button('回到最新').props.onClick();await settle();
     assert.equal(charts[0].options.scales.x.max,clock);
     assert.equal(charts[0].data.datasets[0].data.at(-1).x,clock-20000);
+    const lossPoint=charts[1].data.datasets[0].data.at(-1);
+    assert.equal(lossPoint.y,100/15);
+    assert.equal(charts[1].options.scales.y.max,10);
+    assert.match(charts[1].options.plugins.tooltip.callbacks.label({parsed:{y:lossPoint.y},raw:lossPoint,dataset:{label:'测试线路'}}),/15 次中失败 1 次/);
     assert.equal(queries.length,10); // range/slider operations are local
     button('24H').props.onClick();await settle();
     assert.equal(all().filter(node=>node.type==='input'&&node.props.type==='range').length,0);
     document.hidden=true;
     await intervals[0].callback();
     assert.equal(queries.length,10);
-    document.hidden=false;clock+=60000;listeners.get('visibilitychange')();
+    document.hidden=false;clock+=6*60000;allFailed=true;listeners.get('visibilitychange')();
     for(let i=0;i<20&&queries.length<11;i++)await settle();
     assert.equal(queries.length,11);
     await settle();
     assert.equal(charts[0].options.scales.x.max,clock);
+    assert.equal(charts[1].data.datasets[0].data.at(-1).y,100); // actual all-failed windows remain 100%
+    assert.equal(charts[1].options.scales.y.max,100);
     app.unmount();app=null;
     assert.ok(charts.every(chart=>chart.destroyed));
     assert.ok(intervals[0].cleared);
