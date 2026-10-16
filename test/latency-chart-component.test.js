@@ -2,9 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { parse, compileScript } from '@vue/compiler-sfc';
-import { createRenderer, h, nextTick } from 'vue';
+import { createRenderer, h, nextTick, ref } from 'vue';
 
-test('mounted charts update automatically; 24H hides the slider and history review stays fixed', async () => {
+test('mounted charts have independent ranges and history controls while sharing automatic updates', async () => {
   const filename = new URL('../src/frontend/components/LatencyDetailCharts.vue', import.meta.url);
   const { descriptor } = parse(await readFile(filename, 'utf8'), { filename: filename.pathname });
   const vueURL = import.meta.resolve('vue');
@@ -54,13 +54,18 @@ test('mounted charts update automatically; 24H hides the slider and history revi
     nextSibling(node) { return node.parent?.children[node.parent.children.indexOf(node)+1]||null; }
   });
   const root={type:'root',children:[]};
-  const all=()=>{const nodes=[];const visit=node=>{nodes.push(node);for(const child of node.children||[])visit(child);};visit(root);return nodes;};
+  const nodesIn=rootNode=>{const nodes=[];const visit=node=>{nodes.push(node);for(const child of node.children||[])visit(child);};visit(rootNode);return nodes;};
+  const all=()=>nodesIn(root);
+  const sectionNodes=index=>nodesIn(all().filter(node=>node.type==='section')[index]);
   const text=node=>node.type==='#comment'?'':(node.text||'')+(node.children||[]).map(text).join('');
   const settle=async()=>{await nextTick();await new Promise(resolve=>setTimeout(resolve,5));await nextTick();};
-  const button=label=>all().find(node=>node.type==='button'&&text(node)===label);
+  const button=(label,section)=> (section===undefined?all():sectionNodes(section)).find(node=>node.type==='button'&&text(node)===label);
+  const slider=section=>sectionNodes(section).find(node=>node.type==='input'&&node.props.type==='range');
+  const bounds=index=>({...charts[index].options.scales.x});
+  const selectedHours=ref(24),rangeEvents=[];
   try {
     const Component=(await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`)).default;
-    app=renderer.createApp({render:()=>h(Component,{serverId:'ui-node',labels:['测试线路'],selectedHours:24})});
+    app=renderer.createApp({render:()=>h(Component,{serverId:'ui-node',labels:['测试线路'],selectedHours:selectedHours.value,'onUpdate:selectedHours':value=>{rangeEvents.push(value);selectedHours.value=value;}})});
     app.mount(root);
     for(let i=0;i<60&&!text(root).includes('历史尚未加载完整');i++)await settle();
     assert.match(text(root),/历史尚未加载完整/);
@@ -79,15 +84,40 @@ test('mounted charts update automatically; 24H hides the slider and history revi
     assert.equal(charts.length,2);
     assert.equal(all().filter(node=>node.type==='input'&&node.props.type==='range').length,0);
     assert.match(text(root),/每分钟自动刷新/);
+    const initialLatency=bounds(0);
+    for(const [label,minutes] of [['10M',10],['30M',30],['1H',60],['6H',360],['12H',720],['24H',1440]]) {
+      button(label,1).props.onClick();await settle();
+      assert.equal(charts[1].options.scales.x.max-charts[1].options.scales.x.min,minutes*60000);
+      assert.equal(charts[0].options.scales.x.min,initialLatency.min);
+      assert.equal(charts[0].options.scales.x.max,initialLatency.max);
+      assert.equal(button(label,1).props['aria-pressed'],true);
+      if(minutes<1440)assert.equal(slider(1).props.max,1440-minutes);
+      else assert.equal(slider(1),undefined);
+    }
+    assert.equal(rangeEvents.length,0); // loss controls never change the page's latency range
+    button('30M',1).props.onClick();await settle();
+    slider(1).props.onInput({target:{value:'120'}});await settle();
+    const lossReview=bounds(1);
+    selectedHours.value=6;await settle(); // an external page range change must also leave loss alone
+    assert.equal(charts[0].options.scales.x.max-charts[0].options.scales.x.min,6*3600000);
+    assert.equal(charts[1].options.scales.x.min,lossReview.min);
+    assert.equal(charts[1].options.scales.x.max,lossReview.max);
+    assert.equal(slider(1).props.value,120);
+    assert.equal(button('30M',1).props['aria-pressed'],true);
+    selectedHours.value=24;await settle();
+    assert.equal(slider(0),undefined); // each chart hides only its own slider at 24H
+    assert.ok(slider(1));
+    button('24H',1).props.onClick();await settle();
     for(const [label,minutes] of [['10M',10],['30M',30],['1H',60],['6H',360],['12H',720]]) {
       button(label).props.onClick();await settle();
       assert.equal(charts[0].options.scales.x.max-charts[0].options.scales.x.min,minutes*60000);
-      assert.equal(all().find(node=>node.type==='input'&&node.props.type==='range').props.max,1440-minutes);
+      assert.equal(slider(0).props.max,1440-minutes);
+      assert.equal(charts[1].options.scales.x.max-charts[1].options.scales.x.min,86400000);
     }
     button('10M').props.onClick();await settle();
-    const slider=all().find(node=>node.type==='input'&&node.props.type==='range');
-    assert.equal(slider.props.max,1430);
-    slider.props.onInput({target:{value:'60'}});await settle();
+    button('30M',1).props.onClick();await settle();
+    assert.equal(slider(0).props.max,1430);
+    slider(0).props.onInput({target:{value:'60'}});await settle();
     assert.match(text(root),/正在回看固定历史时段/);
     const reviewEnd=charts[0].options.scales.x.max;
     assert.equal(intervals[0].delay,60000);
@@ -95,6 +125,7 @@ test('mounted charts update automatically; 24H hides the slider and history revi
     await intervals[0].callback();await settle();
     assert.equal(queries.length,10);
     assert.equal(charts[0].options.scales.x.max,reviewEnd);
+    assert.equal(charts[1].options.scales.x.max,clock); // loss follows while latency reviews history
     assert.match(text(root),/历史刷新于/);
     button('回到最新').props.onClick();await settle();
     assert.equal(charts[0].options.scales.x.max,clock);
@@ -104,14 +135,28 @@ test('mounted charts update automatically; 24H hides the slider and history revi
     assert.equal(charts[1].options.scales.y.max,10);
     assert.match(charts[1].options.plugins.tooltip.callbacks.label({parsed:{y:lossPoint.y},raw:lossPoint,dataset:{label:'测试线路'}}),/15 次中失败 1 次/);
     assert.equal(queries.length,10); // range/slider operations are local
+    slider(1).props.onInput({target:{value:'120'}});await settle();
+    const fixedLossEnd=charts[1].options.scales.x.max;
+    assert.equal(charts[0].options.scales.x.max,clock);
+    clock+=60000;
+    await intervals[0].callback();await settle();
+    assert.equal(queries.length,11);
+    assert.equal(charts[0].options.scales.x.max,clock); // latency follows while loss reviews history
+    assert.equal(charts[1].options.scales.x.max,fixedLossEnd);
+    button('回到最新',1).props.onClick();await settle();
+    assert.equal(charts[1].options.scales.x.max,clock);
+    assert.equal(charts[0].options.scales.x.max,clock);
+    button('24H',1).props.onClick();await settle();
+    assert.equal(slider(1),undefined);
+    assert.ok(slider(0));
     button('24H').props.onClick();await settle();
     assert.equal(all().filter(node=>node.type==='input'&&node.props.type==='range').length,0);
     document.hidden=true;
     await intervals[0].callback();
-    assert.equal(queries.length,10);
-    document.hidden=false;clock+=6*60000;allFailed=true;listeners.get('visibilitychange')();
-    for(let i=0;i<20&&queries.length<11;i++)await settle();
     assert.equal(queries.length,11);
+    document.hidden=false;clock+=6*60000;allFailed=true;listeners.get('visibilitychange')();
+    for(let i=0;i<20&&queries.length<12;i++)await settle();
+    assert.equal(queries.length,12);
     await settle();
     assert.equal(charts[0].options.scales.x.max,clock);
     assert.equal(charts[1].data.datasets[0].data.at(-1).y,100); // actual all-failed windows remain 100%

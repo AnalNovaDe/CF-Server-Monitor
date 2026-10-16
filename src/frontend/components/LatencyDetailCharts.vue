@@ -2,7 +2,7 @@
   <section v-if="enabled || error || history.enabled === null" class="chart-card full-width latency-detail" :aria-busy="history.busy">
     <div class="chart-card-header">
       <span class="chart-title">▸ {{ en ? 'Latency · raw samples' : '延迟 · 逐次测量' }}</span>
-      <div class="range-buttons">
+      <div class="range-buttons" role="group" :aria-label="en ? 'Latency time range' : '延迟时间范围'">
         <button v-for="option in timeOptions" :key="option.hours" class="btn" :class="{ active: hours === option.hours }" :aria-pressed="hours === option.hours" @click="setRange(option.hours)">{{ option.label }}</button>
       </div>
     </div>
@@ -22,7 +22,7 @@
       <div class="time-slider">
         <span class="follow-state">{{ offsetMinutes === 0 ? (en ? 'Following latest · refreshes every minute' : '跟随最新 · 每分钟自动刷新') : (en ? 'Reviewing a fixed history window' : '正在回看固定历史时段') }}</span>
         <template v-if="hours < 24">
-          <label>{{ en ? 'History offset' : '向前回看' }} <input aria-label="历史偏移分钟 / History offset in minutes" type="range" min="0" :max="1440-hours*60" step="5" :value="offsetMinutes" @input="setOffset($event.target.value)" /></label>
+          <label>{{ en ? 'History offset' : '向前回看' }} <input :aria-label="en ? 'Latency history offset in minutes' : '延迟回看偏移分钟'" type="range" min="0" :max="1440-hours*60" step="5" :value="offsetMinutes" @input="setOffset($event.target.value)" /></label>
           <button v-if="offsetMinutes > 0" class="btn" @click="setOffset(0)">{{ en ? 'Back to latest' : '回到最新' }}</button>
         </template>
         <span v-else>{{ en ? 'Full 24h shown. Select a shorter range to scroll through history.' : '已显示全部 24h；选择较短范围后可拖动回看。' }}</span>
@@ -31,9 +31,24 @@
     </template>
   </section>
   <section v-if="enabled" class="chart-card full-width latency-detail">
-    <div class="chart-card-header"><span class="chart-title">▸ {{ lossTitle }}</span></div>
+    <div class="chart-card-header">
+      <span class="chart-title">▸ {{ lossTitle }}</span>
+      <div class="range-buttons" role="group" :aria-label="en ? 'Loss time range' : '丢包率时间范围'">
+        <button v-for="option in timeOptions" :key="option.hours" class="btn" :class="{ active: lossHours === option.hours }" :aria-pressed="lossHours === option.hours" @click="setLossRange(option.hours)">{{ option.label }}</button>
+      </div>
+    </div>
     <p class="detail-note">{{ lossNote }}</p>
+    <p class="detail-note">{{ en ? 'This chart has its own time range and history controls. The loss calculation still uses a 5-minute window.' : '本图独立选择显示范围和回看时段；丢包率仍按最近 5 分钟统计。' }}</p>
     <div class="dense-chart loss"><canvas ref="lossCanvas" :aria-label="lossTitle" role="img"></canvas></div>
+    <div class="time-slider">
+      <span class="follow-state">{{ lossOffsetMinutes === 0 ? (en ? 'Following latest · refreshes every minute' : '跟随最新 · 每分钟自动刷新') : (en ? 'Reviewing a fixed history window' : '正在回看固定历史时段') }}</span>
+      <template v-if="lossHours < 24">
+        <label>{{ en ? 'History offset' : '向前回看' }} <input :aria-label="en ? 'Loss history offset in minutes' : '丢包率回看偏移分钟'" type="range" min="0" :max="1440-lossHours*60" step="5" :value="lossOffsetMinutes" @input="setLossOffset($event.target.value)" /></label>
+        <button v-if="lossOffsetMinutes > 0" class="btn" @click="setLossOffset(0)">{{ en ? 'Back to latest' : '回到最新' }}</button>
+      </template>
+      <span v-else>{{ en ? 'Full 24h shown. Select a shorter range to scroll through history.' : '已显示全部 24h；选择较短范围后可拖动回看。' }}</span>
+      <span>{{ en ? 'View ending' : '截至' }} {{ lossEndLabel }}</span>
+    </div>
   </section>
 </template>
 
@@ -65,6 +80,7 @@ const lossNote = computed(() => {
 })
 const hidden = ref([])
 const hours = ref(24), offsetMinutes = ref(0), historyAnchor = ref(null), clock = ref(Date.now()), pingCanvas = ref(null), lossCanvas = ref(null)
+const lossHours = ref(24), lossOffsetMinutes = ref(0), lossHistoryAnchor = ref(null)
 const lastRefresh = ref(null)
 const colors = ['#00a58b','#e49b40','#4da6ff','#b392f0','#ff7b72','#79c0ff','#60ba66','#fa8a44']
 let ping, loss, timer, disposed = false, observer, drawFrame
@@ -93,6 +109,12 @@ const endLabel = computed(() => new Date(viewEnd.value).toLocaleString())
 const viewEnd = computed(() => (historyAnchor.value ?? clock.value) - offsetMinutes.value * 60000)
 const viewStart = computed(() => viewEnd.value - hours.value * 3600000)
 const chartSeries = computed(() => latencyChartSeries(samples.value, viewStart.value, viewEnd.value))
+const lossViewEnd = computed(() => (lossHistoryAnchor.value ?? clock.value) - lossOffsetMinutes.value * 60000)
+const lossViewStart = computed(() => lossViewEnd.value - lossHours.value * 3600000)
+const lossEndLabel = computed(() => new Date(lossViewEnd.value).toLocaleString())
+const lossChartSeries = computed(() => lossViewStart.value === viewStart.value && lossViewEnd.value === viewEnd.value
+  ? chartSeries.value
+  : latencyChartSeries(samples.value, lossViewStart.value, lossViewEnd.value))
 const loadedMinutes = computed(() => history.value.loadedFrom === null ? 0 : Math.min(1440, Math.round((history.value.asOf - history.value.loadedFrom) / 60000)))
 const statusText = computed(() => {
   if (!history.value.asOf) {
@@ -117,6 +139,13 @@ function setOffset(value) {
   offsetMinutes.value = offset
 }
 function setRange(n) { hours.value=n; setOffset(0); emit('update:selectedHours',n) }
+function setLossOffset(value) {
+  const offset = Math.max(0, Math.min(1440 - lossHours.value * 60, Number(value) || 0))
+  if (offset > 0 && lossHistoryAnchor.value === null) lossHistoryAnchor.value = clock.value
+  if (offset === 0) lossHistoryAnchor.value = null
+  lossOffsetMinutes.value = offset
+}
+function setLossRange(n) { lossHours.value=n; setLossOffset(0) }
 watch(() => props.selectedHours, value => {
   // The existing page uses 0.167 for its 10-minute realtime range.
   const option=timeOptions.find(option => Math.abs(option.hours-value)<0.001)
@@ -154,6 +183,7 @@ function draw() {
   const dark = !document.body.classList.contains('light')
   const text = dark ? '#ced5df' : '#435063', grid = dark ? '#ffffff18' : '#00000015'
   const end = viewEnd.value, start = viewStart.value
+  const lossEnd = lossViewEnd.value, lossStart = lossViewStart.value
   let maxLoss = 0
   const options = (isLoss) => ({ responsive:true, maintainAspectRatio:false, animation:false, parsing:false,
     interaction:{ mode:'nearest',intersect:false }, plugins:{ legend:{display:false}, tooltip:{ callbacks:{ title: items=>items.length ? new Date(items[0].parsed.x).toLocaleString() : '', label:item=> {
@@ -164,17 +194,18 @@ function draw() {
       }
       return label
     } } } },
-    scales:{ x:{ type:'linear',min:start,max:end,grid:{color:grid},ticks:{color:text,maxTicksLimit:8,minRotation:0,maxRotation:0,callback:v=>new Date(v).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})} },y:{min:isLoss?0:undefined,max:isLoss?Math.min(100,Math.max(10,Math.ceil(maxLoss*1.1/5)*5)):undefined,grid:{color:grid},ticks:{color:text},title:{display:true,text:isLoss?'%':'ms',color:text}} }
+    scales:{ x:{ type:'linear',min:isLoss?lossStart:start,max:isLoss?lossEnd:end,grid:{color:grid},ticks:{color:text,maxTicksLimit:8,minRotation:0,maxRotation:0,callback:v=>new Date(v).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})} },y:{min:isLoss?0:undefined,max:isLoss?Math.min(100,Math.max(10,Math.ceil(maxLoss*1.1/5)*5)):undefined,grid:{color:grid},ticks:{color:text},title:{display:true,text:isLoss?'%':'ms',color:text}} }
   })
   const p=[],l=[]
   for (const i of available.value) {
-    const series=chartSeries.value.get(i) || {ping:[],loss:[]}
+    const pingPoints=chartSeries.value.get(i)?.ping || []
+    const lossPoints=lossChartSeries.value.get(i)?.loss || []
     const common={label:props.labels[i]||`Node ${i+1}`,borderColor:colors[i],backgroundColor:colors[i],borderWidth:1,pointRadius:0,tension:0,spanGaps:false,hidden:hidden.value.includes(i)}
-    p.push({...common,data:series.ping})
-    l.push({...common,borderWidth:1.5,data:series.loss})
+    p.push({...common,data:pingPoints})
+    l.push({...common,borderWidth:1.5,data:lossPoints})
     if (!hidden.value.includes(i)) {
-      for (const point of series.loss) {
-        if (point.x >= start && point.x <= end && Number.isFinite(point.y)) maxLoss = Math.max(maxLoss, point.y)
+      for (const point of lossPoints) {
+        if (point.x >= lossStart && point.x <= lossEnd && Number.isFinite(point.y)) maxLoss = Math.max(maxLoss, point.y)
       }
     }
   }
@@ -192,7 +223,7 @@ const onVisibility = () => {
   if (!document.hidden && (!history.value.complete || lastRefresh.value === null || Date.now() - lastRefresh.value >= 60000)) load()
 }
 watch(enabled, active => { emit('active', active); if (!active) destroyCharts() })
-watch([hours,offsetMinutes,historyAnchor,hidden,()=>props.labels,protocol,currentLang], scheduleDraw, { flush:'post' })
+watch([hours,offsetMinutes,historyAnchor,lossHours,lossOffsetMinutes,lossHistoryAnchor,hidden,()=>props.labels,protocol,currentLang], scheduleDraw, { flush:'post' })
 onMounted(()=>{load();timer=setInterval(load,60000);document.addEventListener('visibilitychange',onVisibility);observer=new MutationObserver(scheduleDraw);observer.observe(document.body,{attributes:true,attributeFilter:['class']})})
 onUnmounted(()=>{disposed=true;loader.dispose();clearInterval(timer);cancelAnimationFrame(drawFrame);document.removeEventListener('visibilitychange',onVisibility);observer?.disconnect();destroyCharts()})
 </script>
