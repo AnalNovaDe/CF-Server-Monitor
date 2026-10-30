@@ -39,6 +39,7 @@ jobs:
           done
           ./dist/cf-probe-linux-amd64 version
           (cd dist && sha256sum cf-probe-linux-amd64 cf-probe-linux-arm64 | tee binaries.sha256)
+          while read -r sum file; do echo "::notice title=${file} sha256::${sum}"; done < dist/binaries.sha256
       - name: Compare with installer pins
         run: |
           set -euo pipefail
