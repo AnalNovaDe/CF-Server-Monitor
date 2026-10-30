@@ -380,6 +380,7 @@ import { TIME, DEFAULT_SITE_TITLE, STORAGE, LATENCY_WINDOW } from '../utils/cons
 import { normalizeTimestamp as normalizeMetricTimestamp } from '../utils/time.js'
 import { normalizeDashboardView, normalizeDisplayMode, resolveDisplayMode } from '../utils/displayMode.js'
 import { getPlaybackElapsedMs, resolvePlaybackCursor } from '../utils/playback.js'
+import { applyLiveLatencySample } from '../utils/liveLatencyWindow.js'
 import { getMikusAssetUrl, isMikusThemeEnabled, normalizeThemeOptions, setMikusThemeClass } from '../utils/themeOptions.js'
 import {
   CURRENCY_SYMBOLS,
@@ -868,6 +869,9 @@ const applyServerSample = (serverId, data, sampleTs, displayTs, reportTs = null)
   }, displayTs, now.value)
 
   if (idx >= 0) {
+    // 定制：首页波形最右一格跟随实时值，跨过时间格时整体左移一格
+    merged.ping = applyLiveLatencySample(existing.ping, data, sampleTs, 'ping')
+    merged.loss = applyLiveLatencySample(existing.loss, data, sampleTs, 'loss')
     servers.value[idx] = { ...servers.value[idx], ...merged }
   } else {
     servers.value.push({ ...merged, name: serverId })
