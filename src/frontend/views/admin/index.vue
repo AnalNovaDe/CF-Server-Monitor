@@ -1798,6 +1798,9 @@ const getUninstallCommand = () => {
   return `curl -fsSL '${HOST}/uninstall.sh' | sh -s`
 }
 
+// 定制安装命令仍需要（上游 Beta2 简化安装命令时删除了此函数）
+const hasCorrectionValue = (value) => value !== null && value !== undefined && value !== ''
+
 const copyCmd = (serverId) => {
   const server = servers.value.find(s => s.id === serverId)
   copyServerId.value = serverId
