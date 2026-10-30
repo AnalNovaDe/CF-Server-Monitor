@@ -32,14 +32,24 @@ type latencyBuffer struct {
 	mu     sync.Mutex
 	blocks map[int64][]latencySample
 	sealed int64
+	live   []latencySample // latency.3: recent accepted samples, echoed in realtime reports
 }
 
-func (b *latencyBuffer) add(s latencySample) {
+// latency.3: recent raw samples ride along in every existing report (WSS/POST) as
+// metrics.latency_live, so the dashboard can draw them within seconds. They are the
+// exact samples later uploaded in minute blocks; no extra request is made.
+const (
+	latencyLiveWindow = 25 * time.Second
+	latencyLiveKeep   = 60 * time.Second
+	latencyLiveMax    = 64
+)
+
+func (b *latencyBuffer) add(s latencySample) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	minute := s.T / 60000
 	if minute <= b.sealed {
-		return
+		return false
 	} // closed blocks are immutable, including clock rollback
 	if b.blocks == nil {
 		b.blocks = make(map[int64][]latencySample)
@@ -51,17 +61,46 @@ func (b *latencyBuffer) add(s latencySample) {
 	}
 	existing := b.blocks[minute]
 	if len(existing) >= 32 {
-		return
+		return false
 	}
 	for i := len(existing) - 1; i >= 0; i-- {
 		if existing[i].P == s.P {
 			if s.T-existing[i].T < 15000 {
-				return
+				return false
 			}
 			break
 		}
 	}
 	b.blocks[minute] = append(existing, s)
+	b.live = append(b.live, s)
+	keepFrom := 0
+	for keepFrom < len(b.live) && (b.live[keepFrom].T < s.T-latencyLiveKeep.Milliseconds() || len(b.live)-keepFrom > latencyLiveMax) {
+		keepFrom++
+	}
+	b.live = append([]latencySample(nil), b.live[keepFrom:]...)
+	return true
+}
+
+func (b *latencyBuffer) liveSince(since int64) []latencySample {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := []latencySample{}
+	for _, s := range b.live {
+		if s.T >= since {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func (a *Agent) attachLatencyLive(metrics map[string]any, reportAt time.Time) {
+	stamp, calibrated := a.clock.timestamp(reportAt)
+	if !calibrated {
+		return
+	}
+	if live := a.latency.liveSince(stamp - latencyLiveWindow.Milliseconds()); len(live) > 0 {
+		metrics["latency_live"] = live
+	}
 }
 
 func (b *latencyBuffer) pending(now int64) []latencyBlock {

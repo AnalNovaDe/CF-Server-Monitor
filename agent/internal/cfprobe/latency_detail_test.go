@@ -1,6 +1,7 @@
 package cfprobe
 
 import (
+	"bytes"
 	"net/http"
 	"path/filepath"
 	"testing"
@@ -134,5 +135,63 @@ func TestLatencyUploadClockRecoversExpiredCalibrationAndCorrectsDrift(t *testing
 		if want := server.UnixMilli() + 40; !calibrated || stamp != want {
 			t.Fatalf("timestamp=(%d,%v), want (%d,true)", stamp, calibrated, want)
 		}
+	}
+}
+
+func TestLatencyLiveEchoesAcceptedSamplesOnly(t *testing.T) {
+	var b latencyBuffer
+	r := 1080
+	k := "0123456789abcdef"
+	if !b.add(latencySample{T: 60001000, P: 0, R: &r, K: k}) {
+		t.Fatal("first sample rejected")
+	}
+	if b.add(latencySample{T: 60005000, P: 0, R: &r, K: k}) {
+		t.Fatal("sample closer than 15s accepted")
+	}
+	b.add(latencySample{T: 60021000, P: 0, R: nil, K: k})
+	b.add(latencySample{T: 60021000, P: 1, R: &r, K: k})
+	live := b.liveSince(60010000)
+	if len(live) != 2 || live[0].R != nil || *live[1].R != 1080 || live[1].P != 1 {
+		t.Fatalf("live window wrong: %+v", live)
+	}
+	// Live samples are exactly the uploaded ones, so the dashboard can merge them by p:t:k.
+	block := b.pending(60061000)[0]
+	if len(block.Samples) != 3 || block.Samples[0] != b.liveSince(0)[0] {
+		t.Fatal("live sample differs from minute block sample")
+	}
+	b.pending(60121000)
+	if b.add(latencySample{T: 60030000, P: 2, K: k}) || len(b.liveSince(0)) != 3 {
+		t.Fatal("sealed minute must not reach live echo")
+	}
+}
+
+func TestLatencyLiveIsBounded(t *testing.T) {
+	var b latencyBuffer
+	for i := 0; i < 400; i++ {
+		b.add(latencySample{T: int64(60000000 + i*1000), P: i % 8, K: "0123456789abcdef"})
+	}
+	if len(b.live) > latencyLiveMax {
+		t.Fatalf("live buffer unbounded: %d", len(b.live))
+	}
+	for _, s := range b.live {
+		if s.T < int64(60000000+399*1000)-latencyLiveKeep.Milliseconds() {
+			t.Fatal("old live sample retained")
+		}
+	}
+}
+
+func TestReportBodyCarriesLatencyLiveWhenEnabled(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	agent := Agent{}
+	agent.clock.updateDate(now.UnixMilli(), 0, now)
+	r := 42
+	agent.latency.add(latencySample{T: now.UnixMilli() - 3000, P: 3, R: &r, K: "0123456789abcdef"})
+	body, _, err := agent.buildReportBodyForConfig(Config{LatencyDetail: true}, Metrics{}, now)
+	if err != nil || !bytes.Contains(body, []byte(`"latency_live":[{"t":`)) {
+		t.Fatalf("latency_live missing: %s %v", body, err)
+	}
+	body, _, _ = agent.buildReportBodyForConfig(Config{}, Metrics{}, now)
+	if bytes.Contains(body, []byte("latency_live")) {
+		t.Fatal("latency_live sent while LATENCY_DETAIL is off")
 	}
 }

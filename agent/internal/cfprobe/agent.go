@@ -645,11 +645,15 @@ func (a *Agent) buildReportBody(m Metrics, reportAt time.Time) ([]byte, int, err
 }
 
 func (a *Agent) buildReportBodyForConfig(cfg Config, m Metrics, reportAt time.Time) ([]byte, int, error) {
+	metrics := a.metricsForReport(m, reportAt)
+	if cfg.LatencyDetail {
+		a.attachLatencyLive(metrics, reportAt)
+	}
 	payload := map[string]any{
 		"id":               cfg.ServerID,
 		"secret":           cfg.Secret,
 		"time":             a.clock.snapshot(reportAt),
-		"metrics":          a.metricsForReport(m, reportAt),
+		"metrics":          metrics,
 		"collect_interval": cfg.CollectInterval,
 		"report_interval":  cfg.ReportInterval,
 	}
