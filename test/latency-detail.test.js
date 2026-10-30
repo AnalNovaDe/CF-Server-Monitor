@@ -27,7 +27,9 @@ test('charts preserve spike, missing span, timeout, target switch and bounded da
  assert.equal(rows.loss[2].y,100/3);
  assert.equal(rows.loss.at(-1).y,0);
  assert.ok(rows.ping.some(p=>p.x===now-79999 && p.y===null));
- assert.equal(rows.failures.length,1);
+ assert.equal(rows.loss[2].failed,1);
+ assert.equal(rows.loss[2].retrans,1,'1200ms TCP connect counts as a SYN retransmission');
+ assert.equal(rows.loss.at(-1).retrans,0,'gap resets the window');
  assert.equal(mergeLatencySamples(samples,samples,now).length,4);
  assert.equal(mergeLatencySamples(samples,[],now+86400001).length,0);
  const changed=latencySeries([...samples,{...base,k:'ffffffffffffffff',t:now,r:70}],0);

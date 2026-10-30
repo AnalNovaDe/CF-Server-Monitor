@@ -88,8 +88,23 @@ export async function handleLatencyInstallCheck(request, env) {
   if (!await getServerDetail(env.DB, data.id, true)) return json({ error: 'Not found' }, 404);
   try {
     await env.DB.prepare('SELECT server_slot FROM latency_detail LIMIT 0').all();
-    return json({ enabled: true, version: '1.0.19-latency.2' });
+    return json({ enabled: true, version: '1.0.19-latency.3' });
   } catch { return json({ error: 'Latency storage unavailable; check migration and D1 usage' }, 503); }
+}
+
+// latency.3 agents echo the last ~25s of raw probe samples in every realtime report.
+// Broadcast only: these are never written to D1 here (minute blocks remain the record).
+export const LIVE_MAX_SAMPLES = 64;
+export function sanitizeLatencyLive(value) {
+  if (!Array.isArray(value)) return undefined;
+  const out = [];
+  for (const s of value.slice(-LIVE_MAX_SAMPLES)) {
+    if (!s || !Number.isSafeInteger(s.t) || s.t <= 0 || !Number.isInteger(s.p) || s.p < 0 || s.p > 7) continue;
+    if (s.r !== null && (!Number.isInteger(s.r) || s.r < 0 || s.r > 60000)) continue;
+    if (typeof s.k !== 'string' || !/^[a-f0-9]{16}$/.test(s.k)) continue;
+    out.push({ t: s.t, p: s.p, r: s.r, k: s.k });
+  }
+  return out.length ? out : undefined;
 }
 
 // Primary-key ranges, not a scan of the resource history tables.

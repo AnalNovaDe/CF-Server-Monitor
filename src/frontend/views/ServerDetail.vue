@@ -326,7 +326,7 @@
         </div>
       </div>
 
-      <LatencyDetailCharts :key="serverId + apiIndex" :server-id="serverId" :api-index="apiIndex" :labels="denseLatencyLabels" :selected-hours="denseLatencyHours" :probe-mode="server.ping_mode || 'tcp'" @update:selected-hours="setTimeRange" @active="denseLatencyActive = $event" />
+      <LatencyDetailCharts :key="serverId + apiIndex" :server-id="serverId" :api-index="apiIndex" :labels="denseLatencyLabels" :selected-hours="denseLatencyHours" :probe-mode="server.ping_mode || 'tcp'" :live-samples="server.latency_live" @update:selected-hours="setTimeRange" @active="denseLatencyActive = $event" />
       <div class="chart-card" :class="{ 'full-width': isChartExpanded('ping') }" v-show="hasPingData && !denseLatencyActive">
         <div class="chart-card-header">
           <span class="chart-title">
@@ -443,7 +443,8 @@ const denseLatencyLabels = computed(() => ['ct','cu','cm','bd','node_1','node_2'
 const server = ref({})
 const REALTIME_HISTORY_HOURS = 0.167
 const LATEST_REPORT_MAX_REPLAY_DELAY = 120000
-const REPORT_CHART_UPDATE_INTERVAL_MS = 30000
+// 定制：上游为 30 秒；改为与 WSS 默认上报间隔（2 秒）一致，所有面板同步实时追加
+const REPORT_CHART_UPDATE_INTERVAL_MS = 2000
 const currentHours = ref(REALTIME_HISTORY_HOURS)
 const lastUpdateText = ref('')
 const config = ref(null)

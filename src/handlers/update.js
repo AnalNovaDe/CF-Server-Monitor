@@ -1,3 +1,4 @@
+import { sanitizeLatencyLive } from './latencyDetail.js';
 import { saveMetricsHistory } from '../database/schema.js';
 import { getServerDetail, clearServerDetailCache, patchServerDetailCache } from '../utils/cache.js';
 import { evaluateTrafficAlert } from '../services/notification.js';
@@ -55,7 +56,10 @@ function buildPayloadForBroadcast(id, metrics = {}, extra = {}) {
   payload.agent_version = extra.agentVersion || metrics.agent_version || '';
   payload.last_updated = extra.timestamp || metrics.timestamp || Date.now();
   payload.timestamp = payload.last_updated;
-  return coerceNumericMetricFields(payload);
+  const latencyLive = sanitizeLatencyLive(metrics.latency_live);
+  const coerced = coerceNumericMetricFields(payload);
+  if (latencyLive) coerced.latency_live = latencyLive;
+  return coerced;
 }
 
 // 批量推送：前端实时使用短窗口；仅资源告警缓存时使用较长窗口降低 DO 请求。
@@ -323,6 +327,7 @@ export function getHistoryMetrics(data, samples, latestSample) {
 function buildSamplePayloadForBroadcast(metrics = {}, timestamp = Date.now()) {
   const payload = metrics && typeof metrics === 'object' ? { ...metrics } : {};
   BROADCAST_DELETE_FIELDS.forEach(field => delete payload[field]);
+  delete payload.latency_live;
   payload.last_updated = timestamp;
   payload.sample_timestamp = timestamp;
   return coerceNumericMetricFields(payload);
