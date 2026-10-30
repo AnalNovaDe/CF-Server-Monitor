@@ -15,7 +15,7 @@ test('live samples draw within seconds, merge with history and the axis keeps sp
     .replace("import Chart from 'chart.js/auto'", 'const Chart=globalThis.__liveTestChart')
     .replace("import { http } from '../utils/http'", 'const http=globalThis.__liveTestHttp')
     .replace("import { currentLang } from '../utils/i18n'", "const currentLang=ref('zh')");
-  for (const module of ['latencyDetail', 'latencyHistory']) {
+  for (const module of ['latencyDetail', 'latencyHistory', 'chartWindow']) {
     source = source.replace(`'../utils/${module}.js'`, `'${new URL(`../src/frontend/utils/${module}.js`, import.meta.url).href}'`);
   }
   const saved = Object.fromEntries(['document', 'MutationObserver', 'requestAnimationFrame', 'cancelAnimationFrame', 'setInterval', 'clearInterval'].map(key => [key, globalThis[key]]));
@@ -93,6 +93,11 @@ test('live samples draw within seconds, merge with history and the axis keeps sp
     assert.equal(atSpike().y, 100 / atSpike().attempts, 'retransmit counted as loss');
     const lossLabel = charts[1].options.plugins.tooltip.callbacks.label({ dataset: { label: '测试线路' }, raw: atSpike(), parsed: { y: atSpike().y } });
     assert.match(lossLabel, /失败 0 次，重传 1 次/);
+
+    // A success between two failures is drawn as a dot.
+    assert.equal(pingLine().pointRadius({ dataset: { data: [{ y: null }, { y: 80 }, { y: null }] }, dataIndex: 1 }), 1.6);
+    assert.equal(pingLine().pointRadius({ dataset: { data: [{ y: 70 }, { y: 80 }, { y: null }] }, dataIndex: 1 }), 0);
+    assert.equal(pingLine().pointRadius({ dataset: { data: [{ y: null }] }, dataIndex: 0 }), 0);
 
     // Live samples: appear immediately at the right edge, without waiting for the minute upload.
     assert.match(text(root), /每分钟刷新 · 最新/);

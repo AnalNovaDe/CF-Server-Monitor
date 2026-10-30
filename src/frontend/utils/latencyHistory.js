@@ -7,6 +7,9 @@ const DAY = 1440 * MINUTE;
 export function createLatencyHistoryLoader({ request, onChange, onPage = async () => {}, now = Date.now, paused = () => false }) {
   let state = { enabled: null, samples: [], loadedFrom: null, asOf: 0, nextBefore: 0, complete: false, busy: false, error: '' };
   let disposed = false;
+  // Live samples that arrive before the first history page (e.g. the cached latest report
+  // replayed on page load) are kept here and merged with that page instead of being dropped.
+  let pendingLive = [];
   const stopped = () => disposed || paused();
   const publish = patch => { state = { ...state, ...patch }; if (!disposed) onChange(state); };
 
@@ -35,7 +38,9 @@ export function createLatencyHistoryLoader({ request, onChange, onPage = async (
   }
 
   async function accept(data, patch) {
-    publish({ enabled: true, samples: mergeLatencySamples(state.samples, data.samples, now()), ...patch });
+    const live = pendingLive;
+    pendingLive = [];
+    publish({ enabled: true, samples: mergeLatencySamples(state.samples, [...data.samples, ...live], now()), ...(live.length ? { liveAt: now() } : {}), ...patch });
     // Render and yield after every page, including the first one, before starting another request.
     await onPage();
   }
@@ -85,7 +90,12 @@ export function createLatencyHistoryLoader({ request, onChange, onPage = async (
   // Raw samples echoed in realtime reports (latency.3 agents). They are identical to the
   // later minute-block records, so merging by p:t:k never duplicates or changes them.
   function addLive(incoming) {
-    if (disposed || state.enabled !== true || !Array.isArray(incoming) || !incoming.length) return false;
+    if (disposed || !Array.isArray(incoming) || !incoming.length) return false;
+    if (state.enabled === false) return false;
+    if (state.enabled !== true) {
+      pendingLive = mergeLatencySamples(pendingLive, incoming, now()).slice(-512);
+      return false;
+    }
     const recent = new Set(state.samples.slice(-256).map(sampleKey));
     const fresh = incoming.filter(s => !recent.has(sampleKey(s)));
     if (!fresh.length) return false;

@@ -88,13 +88,13 @@ export async function handleLatencyInstallCheck(request, env) {
   if (!await getServerDetail(env.DB, data.id, true)) return json({ error: 'Not found' }, 404);
   try {
     await env.DB.prepare('SELECT server_slot FROM latency_detail LIMIT 0').all();
-    return json({ enabled: true, version: '1.0.19-latency.4' });
+    return json({ enabled: true, version: '1.0.19-latency.5' });
   } catch { return json({ error: 'Latency storage unavailable; check migration and D1 usage' }, 503); }
 }
 
-// latency.3 agents echo the last ~25s of raw probe samples in every realtime report.
-// Broadcast only: these are never written to D1 here (minute blocks remain the record).
-export const LIVE_MAX_SAMPLES = 64;
+// latency.3+ agents echo recent raw probe samples in every realtime report (latency.5: 150s,
+// at most 72). Broadcast only: never written to D1 here (minute blocks remain the record).
+export const LIVE_MAX_SAMPLES = 96;
 export function sanitizeLatencyLive(value) {
   if (!Array.isArray(value)) return undefined;
   const out = [];

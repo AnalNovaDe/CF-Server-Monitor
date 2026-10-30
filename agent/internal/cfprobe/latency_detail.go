@@ -38,11 +38,26 @@ type latencyBuffer struct {
 // latency.3: recent raw samples ride along in every existing report (WSS/POST) as
 // metrics.latency_live, so the dashboard can draw them within seconds. They are the
 // exact samples later uploaded in minute blocks; no extra request is made.
+// latency.5: the echo covers 150s, longer than the newest minute block can take
+// to reach the Worker, so a page opened at any moment has no gap between the
+// stored history and the live samples (8 routes x 7.5 samples <= 72).
 const (
-	latencyLiveWindow = 25 * time.Second
-	latencyLiveKeep   = 60 * time.Second
-	latencyLiveMax    = 64
+	latencyLiveWindow = 150 * time.Second
+	latencyLiveKeep   = 180 * time.Second
+	latencyLiveMax    = 72
 )
+
+// latency.5: upload each minute block shortly after the minute closes instead of
+// on a ticker with an arbitrary phase, so stored history lags by ~1 minute at most.
+const latencyUploadDelay = 3 * time.Second
+
+func nextLatencyUpload(now time.Time) time.Duration {
+	wait := now.Truncate(time.Minute).Add(latencyUploadDelay).Sub(now)
+	if wait <= 0 {
+		wait += time.Minute
+	}
+	return wait
+}
 
 func (b *latencyBuffer) add(s latencySample) bool {
 	b.mu.Lock()
@@ -201,14 +216,15 @@ func (a *Agent) observeLatencyUploadResponse(status int, headers http.Header, st
 }
 
 func (a *Agent) latencyUploadWorker(ctx context.Context) {
-	ticker := time.NewTicker(time.Minute)
-	defer ticker.Stop()
+	timer := time.NewTimer(nextLatencyUpload(time.Now()))
+	defer timer.Stop()
 	a.log.info("custom latency enabled: 20s probes, minute blocks, 30min in-memory retry buffer; upstream auto-update disabled")
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-timer.C:
+			timer.Reset(nextLatencyUpload(time.Now()))
 			cfg := a.configSnapshot()
 			if !cfg.LatencyDetail {
 				continue

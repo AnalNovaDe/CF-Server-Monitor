@@ -195,3 +195,27 @@ func TestReportBodyCarriesLatencyLiveWhenEnabled(t *testing.T) {
 		t.Fatal("latency_live sent while LATENCY_DETAIL is off")
 	}
 }
+
+func TestLatencyUploadRunsJustAfterEachMinute(t *testing.T) {
+	base := time.Date(2026, 10, 30, 23, 44, 0, 0, time.UTC)
+	for _, c := range []struct{ at, want time.Duration }{
+		{0, 3 * time.Second},
+		{2 * time.Second, time.Second},
+		{3 * time.Second, time.Minute},
+		{10 * time.Second, 53 * time.Second},
+		{59 * time.Second, 4 * time.Second},
+	} {
+		if got := nextLatencyUpload(base.Add(c.at)); got != c.want {
+			t.Fatalf("at +%v: wait %v, want %v", c.at, got, c.want)
+		}
+	}
+}
+
+func TestLatencyLiveCoversUploadLag(t *testing.T) {
+	if latencyLiveWindow < 2*time.Minute || latencyLiveKeep < latencyLiveWindow {
+		t.Fatal("live echo must outlast the newest minute block's upload delay")
+	}
+	if int(latencyLiveWindow/(20*time.Second))*8 > latencyLiveMax+8 {
+		t.Fatal("live buffer cannot hold 8 routes over the window")
+	}
+}
