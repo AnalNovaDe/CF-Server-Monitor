@@ -17,13 +17,19 @@ import (
 )
 
 const (
-	defaultPingTimeout      = 1500 * time.Millisecond
-	highLatencyThresholdMS  = 1000
-	pingHighLatencyRetries  = 3
-	retryDropThresholdTCPMS = 800
-	defaultTaskPingTCPPort  = 80
-	defaultMetricsTCPPort   = 80
-	dnsCacheTTL             = 30 * time.Minute
+	defaultPingTimeout = 1500 * time.Millisecond
+	// latency.4: the metrics TCP probe gives up on the handshake before Linux's
+	// 1s initial SYN retransmit. A longer wait turns a dropped SYN into a late
+	// "success" of RTO + RTT (~1000+ ms); cut short, every reading is a handshake
+	// completed on the first SYN and a dropped one is recorded as a loss. Name
+	// resolution keeps defaultPingTimeout so a slow resolver is not read as loss.
+	metricsTCPHandshakeTimeout = 900 * time.Millisecond
+	highLatencyThresholdMS     = 1000
+	pingHighLatencyRetries     = 3
+	retryDropThresholdTCPMS    = 800
+	defaultTaskPingTCPPort     = 80
+	defaultMetricsTCPPort      = 80
+	dnsCacheTTL                = 30 * time.Minute
 )
 
 type dnsCacheEntry struct {
@@ -106,11 +112,15 @@ func resolveFirstIP(ctx context.Context, host string) (string, error) {
 }
 
 func tcpPing(target string, defaultPort int, timeout time.Duration) (int, error) {
+	return tcpPingWithHandshake(target, defaultPort, timeout, timeout)
+}
+
+func tcpPingWithHandshake(target string, defaultPort int, resolveTimeout, timeout time.Duration) (int, error) {
 	host, port, err := splitProbeTarget(target, defaultPort)
 	if err != nil {
 		return -1, err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), resolveTimeout)
 	defer cancel()
 	ip, err := resolveFirstIP(ctx, host)
 	if err != nil {
@@ -250,7 +260,7 @@ func measureProbe(kind, target string, count, defaultPort int, log logger) Probe
 		if kind == pingModeICMP {
 			ms, err = icmpPing(target, defaultPingTimeout)
 		} else {
-			ms, err = tcpPing(target, defaultPort, defaultPingTimeout)
+			ms, err = tcpPingWithHandshake(target, defaultPort, defaultPingTimeout, metricsTCPHandshakeTimeout)
 		}
 		if err == nil {
 			ok++

@@ -12,23 +12,19 @@
     </div>
     <p v-if="error" class="detail-note" role="alert">{{ error }} <button class="btn" :disabled="history.busy" @click="load">{{ en ? 'Resume loading' : '继续加载' }}</button></p>
     <template v-if="enabled">
-      <p class="detail-note">{{ en ? '20s target interval · minute uploads · last 24h retained. Click a route to hide or show it in this chart.' : '目标间隔 20 秒 · 按分钟上传 · 保留最近 24h；点击线路名称可隐藏或显示本图中的线路。' }}
-        {{ en ? 'Loaded samples' : '已加载记录（含失败）' }}: {{ samples.length }} · {{ en ? 'Newest' : '最新测量' }}: {{ newest }} · {{ en ? 'History refreshed' : '历史刷新于' }}: {{ refreshedAt }}</p>
       <div class="route-buttons" role="group" :aria-label="en ? 'Latency route visibility' : '延迟线路显示'">
         <button v-for="i in available" :key="i" class="btn" :style="{ color: colors[i], opacity: pingHidden.includes(i) ? .4 : 1 }" :aria-pressed="!pingHidden.includes(i)" @click="toggleRoute(i)">{{ labels[i] || `Node ${i+1}` }}</button>
         <button class="btn axis-toggle" :class="{ active: fullAxis }" :aria-pressed="fullAxis" @click="fullAxis = !fullAxis">{{ fullAxis ? (en ? 'Full axis' : '完整纵轴') : (en ? 'Adaptive axis' : '自适应纵轴') }}</button>
       </div>
-      <p v-if="pingCap" class="detail-note">{{ en ? `Axis capped at ${pingCap} ms; ▲ marks samples above it (hover for the real value).` : `纵轴封顶 ${pingCap} ms，▲ 表示超出的测量（悬停查看实际值）。` }}<template v-if="protocol === 'TCP'">{{ en ? ' ≥1000 ms usually means the first SYN was lost and retransmitted.' : ' ≥1000 ms 通常是首个 SYN 丢失后 1 秒重传。' }}</template></p>
+      <p v-if="pingCap" class="detail-note">{{ en ? `Axis capped at ${pingCap} ms; ▲ marks higher values (hover for the real value).` : `纵轴封顶 ${pingCap} ms，▲ 为超出值，悬停看实际值。` }}</p>
       <p v-if="!samples.length && history.complete" class="detail-note">{{ en ? 'No measurements in the loaded 24h. Check Agent uploads; earlier detailed samples cannot be reconstructed.' : '最近 24h 已读取完毕，未找到测量记录；请检查 Agent 上报。启用前的高精度历史无法补回。' }}</p>
       <div class="dense-chart"><canvas ref="pingCanvas" :aria-label="en ? 'Raw latency chart' : '逐次延迟图'" role="img"></canvas></div>
-      <div class="time-slider">
-        <span class="follow-state">{{ offsetMinutes === 0 ? followText : (en ? 'Reviewing a fixed history window' : '正在回看固定历史时段') }}</span>
-        <template v-if="hours < 24">
-          <label>{{ en ? 'History offset' : '向前回看' }} <input :aria-label="en ? 'Latency history offset in minutes' : '延迟回看偏移分钟'" type="range" min="0" :max="1440-hours*60" step="5" :value="offsetMinutes" @input="setOffset($event.target.value)" /></label>
-          <button v-if="offsetMinutes > 0" class="btn" @click="setOffset(0)">{{ en ? 'Back to latest' : '回到最新' }}</button>
+      <div v-if="hours < 24" class="time-slider">
+        <label>{{ en ? 'History offset' : '向前回看' }} <input :aria-label="en ? 'Latency history offset in minutes' : '延迟回看偏移分钟'" type="range" min="0" :max="1440-hours*60" step="5" :value="offsetMinutes" @input="setOffset($event.target.value)" /></label>
+        <template v-if="offsetMinutes > 0">
+          <span class="follow-state">{{ en ? 'Reviewing a fixed history window' : '正在回看固定历史时段' }} · {{ en ? 'until' : '截至' }} {{ endLabel }}</span>
+          <button class="btn" @click="setOffset(0)">{{ en ? 'Back to latest' : '回到最新' }}</button>
         </template>
-        <span v-else>{{ en ? 'Full 24h shown. Select a shorter range to scroll through history.' : '已显示全部 24h；选择较短范围后可拖动回看。' }}</span>
-        <span>{{ en ? 'View ending' : '截至' }} {{ endLabel }}</span>
       </div>
     </template>
   </section>
@@ -40,20 +36,16 @@
       </div>
     </div>
     <p class="detail-note">{{ lossNote }}</p>
-    <p class="detail-note">{{ en ? 'Route visibility, time range and history controls are independent for this chart. Click a route to hide or show it; measurements continue. Loss still uses a 5-minute window.' : '本图的线路显隐、显示范围和回看时段均独立；点击线路名称可隐藏或显示，测量仍继续。丢包率按最近 5 分钟统计。' }}</p>
     <div class="route-buttons" role="group" :aria-label="en ? 'Loss route visibility' : '丢包率线路显示'">
       <button v-for="i in available" :key="i" class="btn" :style="{ color: colors[i], opacity: lossHidden.includes(i) ? .4 : 1 }" :aria-pressed="!lossHidden.includes(i)" @click="toggleRoute(i, true)">{{ labels[i] || `Node ${i+1}` }}</button>
-      <button v-if="protocol === 'TCP'" class="btn axis-toggle" :class="{ active: includeRetrans }" :aria-pressed="includeRetrans" @click="includeRetrans = !includeRetrans">{{ en ? 'Count SYN retransmits' : '计入 SYN 重传' }}</button>
     </div>
     <div class="dense-chart loss"><canvas ref="lossCanvas" :aria-label="lossTitle" role="img"></canvas></div>
-    <div class="time-slider">
-      <span class="follow-state">{{ lossOffsetMinutes === 0 ? followText : (en ? 'Reviewing a fixed history window' : '正在回看固定历史时段') }}</span>
-      <template v-if="lossHours < 24">
-        <label>{{ en ? 'History offset' : '向前回看' }} <input :aria-label="en ? 'Loss history offset in minutes' : '丢包率回看偏移分钟'" type="range" min="0" :max="1440-lossHours*60" step="5" :value="lossOffsetMinutes" @input="setLossOffset($event.target.value)" /></label>
-        <button v-if="lossOffsetMinutes > 0" class="btn" @click="setLossOffset(0)">{{ en ? 'Back to latest' : '回到最新' }}</button>
+    <div v-if="lossHours < 24" class="time-slider">
+      <label>{{ en ? 'History offset' : '向前回看' }} <input :aria-label="en ? 'Loss history offset in minutes' : '丢包率回看偏移分钟'" type="range" min="0" :max="1440-lossHours*60" step="5" :value="lossOffsetMinutes" @input="setLossOffset($event.target.value)" /></label>
+      <template v-if="lossOffsetMinutes > 0">
+        <span class="follow-state">{{ en ? 'Reviewing a fixed history window' : '正在回看固定历史时段' }} · {{ en ? 'until' : '截至' }} {{ lossEndLabel }}</span>
+        <button class="btn" @click="setLossOffset(0)">{{ en ? 'Back to latest' : '回到最新' }}</button>
       </template>
-      <span v-else>{{ en ? 'Full 24h shown. Select a shorter range to scroll through history.' : '已显示全部 24h；选择较短范围后可拖动回看。' }}</span>
-      <span>{{ en ? 'View ending' : '截至' }} {{ lossEndLabel }}</span>
     </div>
   </section>
 </template>
@@ -78,17 +70,14 @@ const timeOptions = [
 const en = computed(() => currentLang.value === 'en')
 const protocol = computed(() => props.probeMode === 'icmp' ? 'ICMP' : 'TCP')
 const lossTitle = computed(() => en.value ? `${protocol.value} probe loss rate` : `${protocol.value} 探测丢包率`)
-const lossNote = computed(() => {
-  const basis = protocol.value === 'TCP'
-    ? (en.value ? 'Fraction of failed TCP connection attempts in the last 5 minutes; this is not a TCP packet retransmission rate.' : '折线：最近 5 分钟已执行 TCP 连接探测的失败比例，并非 TCP 数据包重传率。')
-    : (en.value ? 'Fraction of failed ICMP probe attempts in the last 5 minutes, including probe errors.' : '折线：最近 5 分钟已执行 ICMP 探测的失败比例，包含探测错误。')
-  return basis + (en.value ? ' Lines connect recorded measurements; missing measurements remain gaps. The vertical scale adapts to visible data, up to 100%.' : '按测量顺序连线；真实缺测仍留空。纵轴随可见数据调整，最高 100%。')
-})
+const lossNote = computed(() => protocol.value === 'TCP'
+  ? (en.value ? 'Share of probes in the last 5 minutes that hit packet loss (failed or SYN retransmit).' : '最近 5 分钟内遇到丢包（失败或 SYN 重传）的探测比例')
+  : (en.value ? 'Share of probes in the last 5 minutes that failed.' : '最近 5 分钟内探测失败的比例'))
 const pingHidden = ref([]), lossHidden = ref([])
 const hours = ref(24), offsetMinutes = ref(0), historyAnchor = ref(null), clock = ref(Date.now()), pingCanvas = ref(null), lossCanvas = ref(null)
 const lossHours = ref(24), lossOffsetMinutes = ref(0), lossHistoryAnchor = ref(null)
 const lastRefresh = ref(null)
-const fullAxis = ref(false), includeRetrans = ref(false), pingCap = ref(null)
+const fullAxis = ref(false), pingCap = ref(null)
 const colors = ['#00a58b','#e49b40','#4da6ff','#b392f0','#ff7b72','#79c0ff','#60ba66','#fa8a44']
 let ping, loss, timer, disposed = false, observer, drawFrame
 const history = shallowRef({})
@@ -110,12 +99,8 @@ const enabled = computed(() => history.value.enabled === true)
 const samples = computed(() => history.value.samples)
 const error = computed(() => history.value.error ? (en.value ? 'History loading failed; this does not establish a measurement outage: ' : '历史加载失败，不能据此判定测量中断：') + history.value.error : '')
 const available = computed(() => [...new Set(samples.value.map(s => s.p))].sort())
-const newest = computed(() => samples.value.length ? new Date(samples.value.at(-1).t).toLocaleString() : '—')
-const refreshedAt = computed(() => lastRefresh.value ? new Date(lastRefresh.value).toLocaleTimeString() : '—')
 const liveActive = computed(() => !!history.value.liveAt && clock.value - history.value.liveAt < 90000)
-const followText = computed(() => liveActive.value
-  ? (en.value ? 'Following latest · live (new raw samples within seconds)' : '跟随最新 · 实时（原始测量数秒内上图）')
-  : (en.value ? 'Following latest · refreshes every minute' : '跟随最新 · 每分钟自动刷新'))
+const newestTime = computed(() => samples.value.length ? new Date(samples.value.at(-1).t).toLocaleTimeString() : '—')
 const endLabel = computed(() => new Date(viewEnd.value).toLocaleString())
 const viewEnd = computed(() => (historyAnchor.value ?? clock.value) - offsetMinutes.value * 60000)
 const viewStart = computed(() => viewEnd.value - hours.value * 3600000)
@@ -139,8 +124,8 @@ const statusText = computed(() => {
       : `历史${history.value.error ? '尚未加载完整' : history.value.busy ? '加载中' : '加载已暂停'}（${span}）。阴影区域尚未读取；已读取区域的空白表示没有测量记录。`
   }
   return en.value
-    ? `24h history loaded${history.value.busy ? ' · refreshing recent measurements…' : ''}. Empty areas contain no records; the latest minute appears after upload.`
-    : `最近 24h 历史已读取完整${history.value.busy ? '，正在刷新近期记录…' : '。'}空白处表示没有测量记录；最新一分钟需等待上传。`
+    ? `${liveActive.value ? 'Live' : 'Refreshes every minute'} · newest ${newestTime.value}`
+    : `${liveActive.value ? '实时' : '每分钟刷新'} · 最新 ${newestTime.value}`
 })
 function toggleRoute(i, isLoss = false) {
   const hidden = isLoss ? lossHidden : pingHidden
@@ -226,7 +211,8 @@ function draw() {
     const rawPing=chartSeries.value.get(i)?.ping || []
     const pingPoints=cap === null ? rawPing : rawPing.map(point => point.y !== null && point.y > cap ? { x: point.x, y: cap, raw: point.y } : point)
     const rawLoss=lossChartSeries.value.get(i)?.loss || []
-    const lossPoints=includeRetrans.value && protocol.value === 'TCP'
+    // TCP: loss = failed + SYN retransmits (>=1s connects from pre-latency.4 agents).
+    const lossPoints=protocol.value === 'TCP'
       ? rawLoss.map(point => point.attempts ? { ...point, y: 100 * (point.failed + point.retrans) / point.attempts } : point)
       : rawLoss
     const common={label:props.labels[i]||`Node ${i+1}`,borderColor:colors[i],backgroundColor:colors[i],borderWidth:1,pointRadius:0,tension:0,spanGaps:false}
@@ -264,7 +250,7 @@ watch(() => props.liveSamples, live => {
   scheduleDraw()
 })
 watch(enabled, active => { emit('active', active); if (!active) destroyCharts() })
-watch([hours,offsetMinutes,historyAnchor,lossHours,lossOffsetMinutes,lossHistoryAnchor,pingHidden,lossHidden,fullAxis,includeRetrans,()=>props.labels,protocol,currentLang], scheduleDraw, { flush:'post' })
+watch([hours,offsetMinutes,historyAnchor,lossHours,lossOffsetMinutes,lossHistoryAnchor,pingHidden,lossHidden,fullAxis,()=>props.labels,protocol,currentLang], scheduleDraw, { flush:'post' })
 onMounted(()=>{load();timer=setInterval(load,60000);document.addEventListener('visibilitychange',onVisibility);observer=new MutationObserver(scheduleDraw);observer.observe(document.body,{attributes:true,attributeFilter:['class']})})
 onUnmounted(()=>{disposed=true;loader.dispose();clearInterval(timer);cancelAnimationFrame(drawFrame);document.removeEventListener('visibilitychange',onVisibility);observer?.disconnect();destroyCharts()})
 </script>

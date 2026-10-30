@@ -8,6 +8,8 @@ latency.2 修复长期运行时的校时过期隐患：原始记录依赖有效�
 
 latency.3 新增实时回显：每次已有的上报（WSS 或 POST）在 metrics.latency_live 中附带最近 25 秒内已被分钟块接受的原始样本（t/p/r/k，与随后上传的分钟块完全相同）。Worker 只做校验和广播，不写 D1；详情页据此在数秒内绘制新测量，分钟块到达后按 p:t:k 合并，不产生重复。不新增请求、不改变上报或上传频率；内存中最多保留 60 秒/64 条。未启用 LATENCY_DETAIL 时不附带该字段。
 
+latency.4：资源上报使用的 TCP 探测把握手超时设为 900 ms，低于 Linux 首个 SYN 的 1 秒重传定时器。此前 1.5 秒超时会把一次丢失的 SYN 记成约 1000+ ms 的“成功”；现在每个读数都来自首个 SYN 完成的握手，丢失的 SYN 记为失败（丢包）。DNS 解析仍沿用 1.5 秒，解析慢不会被记成丢包。真实往返超过 900 ms 的目标会显示为不可达。ICMP 与任务探测不变。
+
 源码现位于 Worker 仓库 agent/ 目录，由 .github/workflows/custom-agent.yml 在 GitHub Actions 中测试和交叉编译（-trimpath -buildvcs=false，可重复构建），推送 agent-<版本> tag 时核对安装脚本中的 SHA256 后发布 Release。
 
 必须先部署配套 Worker、执行新增表 SQL、在 Worker 变量 LATENCY_DETAIL_SERVER_IDS 中加入本机 UUID，才启用本功能。

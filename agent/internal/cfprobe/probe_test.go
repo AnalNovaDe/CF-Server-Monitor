@@ -285,3 +285,28 @@ func TestRollingProbeHistoryUsesAvailableSamplesBeforeWindowIsFull(t *testing.T)
 		t.Fatalf("Loss = %d, want 50", got.Loss)
 	}
 }
+
+// latency.4: a handshake slower than the SYN retransmit timer is a loss, not a ~1s reading.
+func TestMetricsTCPHandshakeStopsBeforeSYNRetransmit(t *testing.T) {
+	if metricsTCPHandshakeTimeout >= time.Second {
+		t.Fatalf("handshake timeout %v must stay under Linux's 1s initial SYN RTO", metricsTCPHandshakeTimeout)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skip("no loopback listener:", err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+	ms, err := tcpPingWithHandshake(ln.Addr().String(), 80, defaultPingTimeout, metricsTCPHandshakeTimeout)
+	if err != nil || ms < 1 || ms >= int(metricsTCPHandshakeTimeout.Milliseconds()) {
+		t.Fatalf("loopback handshake = %d ms, %v", ms, err)
+	}
+}
