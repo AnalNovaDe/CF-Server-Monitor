@@ -79,12 +79,12 @@ test('mounted charts have independent routes, ranges and history controls while 
     assert.doesNotMatch(text(root),/顶部圆点/);
     assert.equal(charts[0].data.datasets[0].data.filter(point=>point.y!==null).length,2);
     button('继续加载').props.onClick();
-    for(let i=0;i<60&&!text(root).includes('最近 24h 历史已读取完整');i++)await settle();
-    assert.match(text(root),/最近 24h 历史已读取完整/);
+    for(let i=0;i<60&&!text(root).includes('每分钟刷新 · 最新');i++)await settle();
+    assert.match(text(root),/每分钟刷新 · 最新/);
     assert.equal(queries.length,9);
     assert.equal(charts.length,2);
     assert.equal(all().filter(node=>node.type==='input'&&node.props.type==='range').length,0);
-    assert.match(text(root),/每分钟自动刷新/);
+    assert.match(text(root),/每分钟刷新/);
     const visibility=()=>charts.map(chart=>chart.data.datasets.map(dataset=>!dataset.hidden));
     assert.deepEqual(visibility(),[[true,true],[true,true]]);
     button('测试线路',0).props.onClick();await settle();
@@ -139,7 +139,6 @@ test('mounted charts have independent routes, ranges and history controls while 
     assert.deepEqual(visibility(),[[false,true],[true,false]]); // ranges, sliders and automatic refresh retain each chart's choices
     assert.equal(charts[0].options.scales.x.max,reviewEnd);
     assert.equal(charts[1].options.scales.x.max,clock); // loss follows while latency reviews history
-    assert.match(text(root),/历史刷新于/);
     button('回到最新').props.onClick();await settle();
     assert.equal(charts[0].options.scales.x.max,clock);
     assert.equal(charts[0].data.datasets[0].data.at(-1).x,clock-20000);

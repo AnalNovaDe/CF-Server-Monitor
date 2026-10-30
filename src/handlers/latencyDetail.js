@@ -88,7 +88,7 @@ export async function handleLatencyInstallCheck(request, env) {
   if (!await getServerDetail(env.DB, data.id, true)) return json({ error: 'Not found' }, 404);
   try {
     await env.DB.prepare('SELECT server_slot FROM latency_detail LIMIT 0').all();
-    return json({ enabled: true, version: '1.0.19-latency.3' });
+    return json({ enabled: true, version: '1.0.19-latency.4' });
   } catch { return json({ error: 'Latency storage unavailable; check migration and D1 usage' }, 503); }
 }
 

@@ -879,8 +879,9 @@ const getChartTimestamp = (point) => {
   return Number.isFinite(ts) ? ts : 0
 }
 
+// 定制：横轴按时间比例（linear），不再按点等距排列
 const createChartPoint = (timestamp, y) => ({
-  x: String(timestamp),
+  x: Number(timestamp),
   y
 })
 
@@ -895,23 +896,24 @@ const formatChartAxisTime = (value) => {
   return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${time}`
 }
 
+// 定制：固定宽度的时间窗 [现在 - 所选时长, 现在]。实时追加时左端随之右移，
+// 超出窗口的点由 appendDataToChart 丢弃，波形持续向左平移而不是在左侧“折叠”。
 const syncChartLabels = (chart) => {
-  if (!chart) return
-  const seen = new Set()
-  const labels = []
+  if (!chart?.options?.scales?.x) return
+  let newest = 0
   for (const dataset of chart.data.datasets || []) {
-    for (const point of dataset.data || []) {
-      const ts = getChartTimestamp(point)
-      if (!ts) continue
-      const label = String(ts)
-      if (!seen.has(label)) {
-        seen.add(label)
-        labels.push(label)
-      }
-    }
+    const last = getLastDatasetTimestamp(dataset.data)
+    if (last > newest) newest = last
   }
-  labels.sort((a, b) => Number(a) - Number(b))
-  chart.data.labels = labels
+  const end = Math.max(Date.now(), newest)
+  const hours = currentHours.value
+  chart.options.scales.x.min = end - hours * 60 * 60 * 1000
+  chart.options.scales.x.max = end
+  // 刻度落在整分/整点上（UTC+8 等整小时时区下与本地整点一致）
+  const MIN = 60000, HOUR = 3600000
+  const step = hours <= 0.2 ? MIN : hours <= 0.5 ? 5 * MIN : hours <= 1 ? 10 * MIN : hours <= 6 ? HOUR
+    : hours <= 12 ? 2 * HOUR : hours <= 24 ? 3 * HOUR : hours <= 48 ? 6 * HOUR : hours <= 96 ? 12 * HOUR : 24 * HOUR
+  if (chart.options.scales.x.ticks) chart.options.scales.x.ticks.stepSize = step
 }
 
 const ds = (label, color, opts = {}) => ({
@@ -1137,7 +1139,7 @@ const initCharts = () => {
       },
       scales: {
         x: {
-          type: 'category',
+          type: 'linear',
           title: {
             display: false,
             text: '',
@@ -1151,7 +1153,7 @@ const initCharts = () => {
             maxRotation: 0,
             padding: 8,
             callback: function(value) {
-              return formatChartAxisTime(this.getLabelForValue(value))
+              return formatChartAxisTime(value)
             }
           },
           grid: { color: chartTheme.grid, drawBorder: false, tickLength: 0 }

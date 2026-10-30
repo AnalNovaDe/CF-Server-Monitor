@@ -66,14 +66,13 @@ test('live samples draw within seconds, merge with history and the axis keeps sp
     const Component = (await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`)).default;
     app = renderer.createApp({ render: () => h(Component, { serverId: 'live-node', labels: ['测试线路'], selectedHours: 24, probeMode: 'tcp', liveSamples: live.value }) });
     app.mount(root);
-    for (let i = 0; i < 60 && !text(root).includes('已读取完整'); i++) await settle();
-    assert.match(text(root), /已读取完整/);
+    for (let i = 0; i < 60 && !text(root).includes('每分钟刷新 · 最新'); i++) await settle();
     await settle();
 
     // Adaptive axis: capped near the baseline, spike kept as a marker with its real value.
     assert.equal(charts[0].options.scales.y.max, 100);
     assert.match(text(root), /纵轴封顶 100 ms/);
-    assert.match(text(root), /SYN/);
+    assert.doesNotMatch(text(root), /计入 SYN 重传/, 'no toggle: retransmits always count');
     assert.equal(markers().length, 1);
     assert.deepEqual(markers()[0].data.map(p => p.raw), [1100]);
     assert.equal(pingLine().data.find(p => p.raw === 1100).y, 100);
@@ -87,30 +86,23 @@ test('live samples draw within seconds, merge with history and the axis keeps sp
     button('完整纵轴').props.onClick();
     await settle();
 
-    // Retransmit toggle: loss line adds SYN retransmits to failures.
-    const lastLoss = () => charts[1].data.datasets[0].data.filter(p => p.y !== null).at(-1);
-    const before = lastLoss();
-    assert.equal(before.failed, 1);
-    assert.equal(before.retrans, 1, 'the 1100 ms spike is still inside the 5-minute window');
+    // TCP loss always counts >=1s connects (SYN retransmits from older agents) with failures.
     const atSpike = () => charts[1].data.datasets[0].data.find(p => p.x === historySamples[31].t);
-    assert.equal(atSpike().y, 0);
-    button('计入 SYN 重传').props.onClick();
-    await settle();
     assert.equal(atSpike().retrans, 1);
     assert.equal(atSpike().failed, 0);
     assert.equal(atSpike().y, 100 / atSpike().attempts, 'retransmit counted as loss');
-    button('计入 SYN 重传').props.onClick();
-    await settle();
+    const lossLabel = charts[1].options.plugins.tooltip.callbacks.label({ dataset: { label: '测试线路' }, raw: atSpike(), parsed: { y: atSpike().y } });
+    assert.match(lossLabel, /失败 0 次，重传 1 次/);
 
     // Live samples: appear immediately at the right edge, without waiting for the minute upload.
-    assert.match(text(root), /每分钟自动刷新/);
+    assert.match(text(root), /每分钟刷新 · 最新/);
     clock += 10000;
     const fresh = { p: 0, t: clock - 2000, r: 77, k };
     live.value = [fresh];
     await settle();
     assert.ok(pingLine().data.some(p => p.x === fresh.t && p.y === 77), 'live sample drawn');
     assert.ok(charts[0].options.scales.x.max >= fresh.t, 'view follows the live edge');
-    assert.match(text(root), /实时（原始测量数秒内上图）/);
+    assert.match(text(root), /实时 · 最新/);
     const count = () => pingLine().data.filter(p => p.y !== null).length;
     const drawn = count();
     live.value = [fresh];

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Fixed release bootstrap for Linux systemd. No secrets belong in this file.
-# installer-release: agent-installer-1.0.2
+# installer-release: agent-installer-1.0.3
 set -Eeuo pipefail
 umask 077
-cfm_release='https://github.com/AnalNovaDe/CF-Server-Monitor/releases/download/agent-1.0.19-latency.3'
-cfm_version='CF-Server-Monitor Go Probe 1.0.19-latency.3'
+cfm_release='https://github.com/AnalNovaDe/CF-Server-Monitor/releases/download/agent-1.0.19-latency.4'
+cfm_version='CF-Server-Monitor Go Probe 1.0.19-latency.4'
 cfm_id='' cfm_secret='' cfm_url=''
 cfm_args=("$@")
 for cfm_arg in "$@"; do
@@ -83,7 +83,7 @@ cfm_status=$(curl --proto '=https' -sS --connect-timeout 10 --max-time 30 --max-
   -H "Authorization: Bearer $cfm_secret" -H 'Content-Type: application/json' \
   --data "{\"id\":\"$cfm_id\"}" "${cfm_url%/update}/update/latency-check")
 [[ $cfm_status == 200 ]] || cfm_die "Worker readiness check failed ($cfm_status). Check the node allowlist and migration; no installation files changed."
-[[ $(< "$cfm_tmp/readiness.json") == '{"enabled":true,"version":"1.0.19-latency.3"}' ]] || cfm_die 'Worker did not confirm the custom installation protocol; no installation files changed.'
+[[ $(< "$cfm_tmp/readiness.json") == '{"enabled":true,"version":"1.0.19-latency.4"}' ]] || cfm_die 'Worker did not confirm the custom installation protocol; no installation files changed.'
 "${cfm_systemctl[@]}" show-environment >/dev/null
 cfm_fragment=$("${cfm_systemctl[@]}" show cf-probe.service -p FragmentPath --value 2>/dev/null || true)
 [[ -z $cfm_fragment || $cfm_fragment == "$cfm_unit" ]] || cfm_die 'Unexpected service location; review manually.'
@@ -108,6 +108,6 @@ cfm_stage=''
 for cfm_attempt in 1 2 3 4 5; do sleep 1; "${cfm_systemctl[@]}" is-active --quiet cf-probe.service; done
 "${cfm_systemctl[@]}" is-enabled --quiet cf-probe.service
 trap - ERR INT TERM
-printf 'Installed: 1.0.19-latency.3. BACKUP_PATH=%s\n' "$cfm_backup"
+printf 'Installed: 1.0.19-latency.4. BACKUP_PATH=%s\n' "$cfm_backup"
 "${cfm_systemctl[@]}" show cf-probe.service -p ActiveState -p MainPID -p UnitFileState
 printf 'LATENCY_DETAIL=1 AUTO_UPDATE=0. Verify new history after 2-3 minutes and review free usage.\n'
