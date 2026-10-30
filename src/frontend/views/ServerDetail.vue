@@ -401,7 +401,7 @@ import { ref, computed, inject, onMounted, onUnmounted, watch, nextTick, h } fro
 import { useRoute, useRouter } from 'vue-router'
 import TerminalHeader from '../components/TerminalHeader.vue'
 import LatencyDetailCharts from '../components/LatencyDetailCharts.vue'
-import { trimToWindow, mergeCachedPoints } from '../utils/chartWindow.js'
+import { trimToWindow, mergeCachedPoints, timeTickStep, alignedTicks } from '../utils/chartWindow.js'
 import Footer from '../components/Footer.vue'
 import OsIcon from '../components/OsIcon.vue'
 import LiveConnectionTimeoutModal from '../components/LiveConnectionTimeoutModal.vue'
@@ -902,10 +902,12 @@ const formatChartAxisTime = (value) => {
 const LIVE_CHART_CACHE_MAX_AGE = 15 * 60 * 1000
 const liveChartCacheKey = () => `cfsm-live-charts:${serverId}`
 let liveChartCacheSavedAt = 0
+// 图表当前实际显示的时长（历史加载完成后才更新），缓存只保存 10 分钟视图里的数据
+let renderedChartHours = null
 const saveLiveChartCache = () => {
-  if (!chartsReady.value || !isRealtimeHistoryRange()) return
+  if (!chartsReady.value || Math.abs(Number(renderedChartHours) - REALTIME_HISTORY_HOURS) >= 0.001) return
   try {
-    const since = Date.now() - currentHours.value * 60 * 60 * 1000 - 60000
+    const since = Date.now() - REALTIME_HISTORY_HOURS * 60 * 60 * 1000 - 60000
     const payload = { savedAt: Date.now(), charts: {} }
     for (const [key, chart] of Object.entries(charts)) {
       if (!chart?.data?.datasets) continue
@@ -954,11 +956,9 @@ const syncChartLabels = (chart) => {
   const hours = currentHours.value
   chart.options.scales.x.min = end - hours * 60 * 60 * 1000
   chart.options.scales.x.max = end
-  // 刻度落在整分/整点上（UTC+8 等整小时时区下与本地整点一致）
-  const MIN = 60000, HOUR = 3600000
-  const step = hours <= 0.2 ? MIN : hours <= 0.5 ? 5 * MIN : hours <= 1 ? 10 * MIN : hours <= 6 ? HOUR
-    : hours <= 12 ? 2 * HOUR : hours <= 24 ? 3 * HOUR : hours <= 48 ? 6 * HOUR : hours <= 96 ? 12 * HOUR : 24 * HOUR
-  if (chart.options.scales.x.ticks) chart.options.scales.x.ticks.stepSize = step
+  // 刻度落在整分/整点上；不强制把窗口两端当作刻度（否则会出现 00:04:01 这类刻度）
+  const step = timeTickStep(hours, chart.options.scales.x.ticks?.maxTicksLimit || 6)
+  chart.options.scales.x.afterBuildTicks = scale => { scale.ticks = alignedTicks(scale.min, scale.max, step) }
 }
 
 const ds = (label, color, opts = {}) => ({
@@ -1415,6 +1415,8 @@ const loadAllHistory = async (hours) => {
     // 定制：10 分钟视图取 30 分钟历史（接口只接受固定档位），只保留窗口内及窗口前一行，
     // 否则第一条历史常落在窗口起点之后，左侧留白。
     const realtimeRange = Math.abs(Number(hours) - REALTIME_HISTORY_HOURS) < 0.001
+    // 重新加载历史会替换图表数据：先把正在显示的实时 2 秒点存下来，加载后再恢复
+    saveLiveChartCache()
     const fetchedData = await fetchAllHistory(serverId, realtimeRange ? 0.5 : hours, apiIndex.value)
     const allData = realtimeRange
       ? trimToWindow(
@@ -1509,6 +1511,7 @@ const loadAllHistory = async (hours) => {
     }
 
     updateAllChartTimeUnits(hours)
+    renderedChartHours = hours
     restoreLiveChartCache()
     historyLoaded.value = true
 

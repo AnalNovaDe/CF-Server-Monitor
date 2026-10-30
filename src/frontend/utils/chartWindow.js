@@ -24,3 +24,22 @@ export function mergeCachedPoints(current, cached) {
   })
   return [...outside, ...cached].sort((a, b) => ts(a) - ts(b))
 }
+
+// Tick spacing that lands on whole minutes/hours: the smallest step from the ladder that
+// keeps the tick count within `maxTicks` (otherwise Chart.js picks e.g. 100 s itself).
+// Whole-hour time zones such as UTC+8 see local whole hours.
+const STEPS = [1, 2, 5, 10, 15, 30, 60, 120, 180, 360, 720, 1440].map(m => m * 60000)
+export function timeTickStep(hours, maxTicks = 6) {
+  const range = hours * 3600000
+  return STEPS.find(step => range / step <= Math.max(2, maxTicks - 1)) || STEPS[STEPS.length - 1]
+}
+
+// Tick positions at whole multiples of `step` inside [min, max]. Chart.js starts ticks at the
+// axis minimum when min, max and stepSize are all set, so the positions are built here and
+// assigned in an afterBuildTicks hook.
+export function alignedTicks(min, max, step) {
+  if (!Number.isFinite(min) || !Number.isFinite(max) || !(step > 0) || max <= min) return []
+  const ticks = []
+  for (let value = Math.ceil(min / step) * step; value <= max; value += step) ticks.push({ value })
+  return ticks
+}

@@ -20,8 +20,8 @@ cfm_die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 [[ $cfm_id =~ ^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$ && -n $cfm_secret ]] || cfm_die 'Missing server ID or secret.'
 [[ $cfm_url == https://*/update ]] || cfm_die 'An HTTPS /update URL is required.'
 case "$(uname -m)" in
-  x86_64|amd64) cfm_arch=amd64; cfm_sha=7232db11a137efde8fc1683e529efd563d1953dff6092948a3986c6a3f3c35f9 ;;
-  aarch64|arm64) cfm_arch=arm64; cfm_sha=13f72f8b8c2a6acc80e1727836ef601a15329675b4d975428b8805c48e58de06 ;;
+  x86_64|amd64) cfm_arch=amd64; cfm_sha=4f256fc7b0e61fc91c238461a41d01f7591adc1294141bcc775f1c064c9f28f4 ;;
+  aarch64|arm64) cfm_arch=arm64; cfm_sha=07b5e1a27d370d77003d59744a57b0fed3b0b1733059c67172446f910d5520d2 ;;
   *) cfm_die 'Only Linux amd64 and arm64 are supplied in this release.' ;;
 esac
 for cfm_tool in curl sha256sum awk systemctl mktemp cp mv chmod; do

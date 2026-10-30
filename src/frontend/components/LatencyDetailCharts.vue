@@ -57,6 +57,7 @@ import { http } from '../utils/http'
 import { currentLang } from '../utils/i18n'
 import { latencyChartSeries, latencyAxisCap, RETRANSMIT_MS } from '../utils/latencyDetail.js'
 import { createLatencyHistoryLoader } from '../utils/latencyHistory.js'
+import { timeTickStep, alignedTicks } from '../utils/chartWindow.js'
 const props = defineProps({ serverId: String, apiIndex: { type: Number, default: 0 }, labels: { type: Array, default: () => [] }, selectedHours: { type: Number, default: 24 }, probeMode: { type: String, default: 'tcp' }, liveSamples: { type: Array, default: null } })
 const emit = defineEmits(['active', 'update:selectedHours'])
 const timeOptions = [
@@ -197,7 +198,7 @@ function draw() {
       }
       return label
     } } } },
-    scales:{ x:{ type:'linear',min:isLoss?lossStart:start,max:isLoss?lossEnd:end,grid:{color:grid},ticks:{color:text,maxTicksLimit:8,minRotation:0,maxRotation:0,callback:v=>new Date(v).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})} },y:{min:isLoss?0:undefined,max:isLoss?Math.min(100,Math.max(10,Math.ceil(maxLoss*1.1/5)*5)):(cap ?? undefined),grid:{color:grid},ticks:{color:text},title:{display:true,text:isLoss?'%':'ms',color:text}} }
+    scales:{ x:{ type:'linear',min:isLoss?lossStart:start,max:isLoss?lossEnd:end,grid:{color:grid},afterBuildTicks:scale=>{scale.ticks=alignedTicks(scale.min,scale.max,timeTickStep(isLoss?lossHours.value:hours.value,8))},ticks:{color:text,maxTicksLimit:8,minRotation:0,maxRotation:0,callback:v=>new Date(v).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})} },y:{min:isLoss?0:undefined,max:isLoss?Math.min(100,Math.max(10,Math.ceil(maxLoss*1.1/5)*5)):(cap ?? undefined),grid:{color:grid},ticks:{color:text},title:{display:true,text:isLoss?'%':'ms',color:text}} }
   })
   const p=[],l=[],markers=[]
   // Adaptive axis from the visible routes in the visible range.

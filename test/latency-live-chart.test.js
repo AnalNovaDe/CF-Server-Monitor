@@ -15,7 +15,7 @@ test('live samples draw within seconds, merge with history and the axis keeps sp
     .replace("import Chart from 'chart.js/auto'", 'const Chart=globalThis.__liveTestChart')
     .replace("import { http } from '../utils/http'", 'const http=globalThis.__liveTestHttp')
     .replace("import { currentLang } from '../utils/i18n'", "const currentLang=ref('zh')");
-  for (const module of ['latencyDetail', 'latencyHistory']) {
+  for (const module of ['latencyDetail', 'latencyHistory', 'chartWindow']) {
     source = source.replace(`'../utils/${module}.js'`, `'${new URL(`../src/frontend/utils/${module}.js`, import.meta.url).href}'`);
   }
   const saved = Object.fromEntries(['document', 'MutationObserver', 'requestAnimationFrame', 'cancelAnimationFrame', 'setInterval', 'clearInterval'].map(key => [key, globalThis[key]]));

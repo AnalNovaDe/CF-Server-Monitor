@@ -13,7 +13,7 @@ test('mounted charts have independent routes, ranges and history controls while 
     .replace("import Chart from 'chart.js/auto'", 'const Chart=globalThis.__latencyTestChart')
     .replace("import { http } from '../utils/http'", 'const http=globalThis.__latencyTestHttp')
     .replace("import { currentLang } from '../utils/i18n'", "const currentLang=ref('zh')");
-  for (const module of ['latencyDetail', 'latencyHistory']) {
+  for (const module of ['latencyDetail', 'latencyHistory', 'chartWindow']) {
     source = source.replace(`'../utils/${module}.js'`, `'${new URL(`../src/frontend/utils/${module}.js`, import.meta.url).href}'`);
   }
   const saved = Object.fromEntries(['document', 'MutationObserver', 'requestAnimationFrame', 'cancelAnimationFrame', 'setInterval', 'clearInterval'].map(key => [key, globalThis[key]]));
