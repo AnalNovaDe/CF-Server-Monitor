@@ -1,7 +1,7 @@
 import { buildAuthCookie, buildClearAuthCookie, checkAuth, simpleAuthResponse, validateCredentials, generateToken } from '../middleware/auth.js';
 import { getLatestMetricsForAllServers } from '../database/schema.js';
 import { getAllServers, clearServersListCache } from '../utils/cache.js';
-import { clearAppearanceSettingsCache, isValidThemeOptions, isWssReportConfigured, isWssReportEnabled, normalizeBooleanSetting, normalizeDefaultLanguage, normalizeDisplayMode, normalizeExpireNotificationTime, normalizeExpireReminder, normalizeFrontendWsTimeoutMinutes, normalizeLongHistoryPoints, normalizeNotificationLanguage, normalizeNotificationTemplate, normalizeNotificationTimezone, normalizeNotificationWebhookBody, normalizeNotificationWebhookFormat, normalizeNotificationWebhookHeaders, normalizeNotificationWebhookMethod, normalizePreferredTheme, normalizeResourceAlertRules, normalizeTgNotify, normalizeWssReportHours, saveSiteOptions, saveThemeOptions, SITE_FIELDS, APPEARANCE_FIELDS } from '../utils/settings.js';
+import { clearAppearanceSettingsCache, isValidThemeOptions, isWssReportConfigured, isWssReportEnabled, normalizeBooleanSetting, normalizeDefaultLanguage, normalizeDisplayMode, normalizeExpireNotificationTime, normalizeExpireReminder, normalizeFrontendWsTimeoutMinutes, normalizeLongHistoryPoints, normalizeNotificationLanguage, normalizeNotificationTemplate, normalizeNotificationTimezone, normalizeNotificationWebhookBody, normalizeNotificationWebhookFormat, normalizeNotificationWebhookHeaders, normalizeNotificationWebhookMethod, normalizePreferredTheme, normalizeResourceAlertRules, normalizeTgNotify, normalizeWssReportHours, saveSiteOptions, saveThemeOptions, validateUserAgent, SITE_FIELDS, APPEARANCE_FIELDS } from '../utils/settings.js';
 import { mergeMetricsIntoServer } from '../utils/metrics.js';
 import { normalizePctOrNull } from '../utils/traffic.js';
 import { verifyTurnstileToken, hashPassword } from '../utils/common.js';
@@ -596,7 +596,12 @@ async function handleSaveThemeOptionsAction({ env, sys, data }) {
   });
 }
 
-async function handleListAction({ env }) {
+async function handleListAction({ env, data }) {
+  // 管理后台「刷新缓存」会带 refresh: true，跳过本 isolate 的 120 秒列表缓存直接读 D1
+  if (data?.refresh === true) {
+    clearServersListCache();
+  }
+
   const servers = await getAllServers(env.DB);
   const latestMetricsMap = await getLatestMetricsForAllServers(env.DB);
 
@@ -826,6 +831,16 @@ export async function handleAdminAPI(request, env, sys, loadFullSettings = null,
         return createBadRequestResponse('invalidPingNodeFormat');
       }
 
+      // UA 必须在任何写库动作之前校验：否则非法值会留下「外观已保存、站点设置未保存」的半成品状态。
+      let normalizedUserAgent = '';
+      if (settings.ua !== undefined) {
+        const uaResult = validateUserAgent(settings.ua);
+        if (!uaResult.valid) {
+          return createBadRequestResponse('invalidUserAgent');
+        }
+        normalizedUserAgent = uaResult.value;
+      }
+
       if (settings.appearance_options !== undefined && (
         settings.appearance_options === null ||
         typeof settings.appearance_options !== 'object' ||
@@ -890,6 +905,8 @@ export async function handleAdminAPI(request, env, sys, loadFullSettings = null,
             siteOptions[field] = normalizeBooleanSetting(settings[field]);
           } else if (field === 'wss_report_hours') {
             siteOptions[field] = normalizeWssReportHours(settings[field]);
+          } else if (field === 'auto_discovery') {
+            siteOptions[field] = normalizeBooleanSetting(settings[field]);
           } else if (field === 'show_three_net_details') {
             siteOptions[field] = normalizeBooleanSetting(settings[field]);
           } else if (field === 'notification_timezone') {
@@ -912,6 +929,8 @@ export async function handleAdminAPI(request, env, sys, loadFullSettings = null,
             siteOptions[field] = normalizeNotificationTemplate(settings[field]);
           } else if (field === 'theme_url') {
             siteOptions[field] = normalizedThemeUrl;
+          } else if (field === 'ua') {
+            siteOptions[field] = normalizedUserAgent;
           } else {
             siteOptions[field] = settings[field];
           }
