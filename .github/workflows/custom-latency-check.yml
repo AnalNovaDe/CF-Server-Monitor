@@ -14,6 +14,10 @@ jobs:
           node-version: '24'
           cache: npm
       - run: npm ci
+      - name: Undefined identifier check
+        run: |
+          npm install --no-save --no-audit --no-fund eslint@9.39.5 eslint-plugin-vue@10.12.0 vue-eslint-parser@10.4.1 globals@17.13.0
+          npx eslint --no-config-lookup -c .github/lint/no-undef.config.mjs 'src/**/*.js' 'src/**/*.vue'
       - run: npm run test:all
       - run: npm run test:latency
       - run: npm run build:frontend
