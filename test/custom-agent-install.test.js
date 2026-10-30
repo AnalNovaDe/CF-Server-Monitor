@@ -154,7 +154,7 @@ esac
         .replaceAll('/etc/config/cf-probe/config.conf',mode==='system'?conf:join(root,'unused-system-config'))
         .replaceAll('/usr/local/bin/cf-probe',binary)
         .replaceAll('/etc/systemd/system/cf-probe.service',unit)
-        .replaceAll(/(?:f6986f1a33ec7d7ce69215c6768e74c704317a777f2ebc1983d129b4e6835aae|dccc28a3f6eaab789d7484992520f2930e5862cc62de216710407c1ff02d4f14)/g,fakeHash);
+        .replace(/(cfm_arch=(?:amd64|arm64); cfm_sha=)[a-f0-9]{64}/g,`$1${fakeHash}`);
       const file=join(modeHome,'install.sh');await writeFile(file,script);
       const env={...process.env,HOME:modeHome,PATH:`${tools}:${process.env.PATH}`,CFM_TEST_MODE:mode,CFM_TEST_CONF:conf,CFM_TEST_BIN:binary,CFM_TEST_UNIT:unit};
       const args=[file,`-id=${id}`,'-secret=test-secret','-url=https://test/update'];
