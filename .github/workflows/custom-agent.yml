@@ -1,8 +1,9 @@
 name: Custom agent
 # Tests and cross-compiles the customised cf-probe in agent/.
-# Pushing a tag agent-<VERSION> rebuilds, checks the binaries against the SHA256 values
-# pinned in install-custom/install.sh, and publishes the fixed releases used by the
-# admin copy-install command. Builds are reproducible (-trimpath -buildvcs=false).
+# On main (or a pushed agent-<VERSION> tag), if release agent-<VERSION> does not exist yet,
+# it rebuilds, checks the binaries against the SHA256 values pinned in
+# install-custom/install.sh, and publishes the fixed releases used by the admin
+# copy-install command. Builds are reproducible (-trimpath -buildvcs=false).
 on:
   pull_request:
     paths: ['agent/**', 'install-custom/**', '.github/workflows/custom-agent.yml']
@@ -51,7 +52,7 @@ jobs:
               echo "installer pin matches ${arch}: ${built}"
             else
               echo "::warning::install-custom/install.sh does not pin ${arch}=${built} for agent-${version}"
-              if [[ "${GITHUB_REF}" == refs/tags/agent-* ]]; then exit 1; fi
+              if [[ "${GITHUB_REF}" == refs/tags/agent-* || "${GITHUB_REF}" == refs/heads/main ]]; then exit 1; fi
             fi
           done
       - uses: actions/upload-artifact@v4
@@ -60,7 +61,7 @@ jobs:
           path: agent/dist/
 
   publish:
-    if: startsWith(github.ref, 'refs/tags/agent-1.')
+    if: startsWith(github.ref, 'refs/tags/agent-1.') || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -77,7 +78,12 @@ jobs:
         run: |
           set -euo pipefail
           version=$(cat agent/VERSION)
-          [[ "${GITHUB_REF_NAME}" == "agent-${version}" ]] || { echo "tag ${GITHUB_REF_NAME} != agent-${version}"; exit 1; }
+          if [[ "${GITHUB_REF}" == refs/tags/* && "${GITHUB_REF_NAME}" != "agent-${version}" ]]; then
+            echo "tag ${GITHUB_REF_NAME} != agent-${version}"; exit 1
+          fi
+          if gh release view "agent-${version}" >/dev/null 2>&1; then
+            echo "release agent-${version} already exists; nothing to publish"; exit 0
+          fi
           installer_tag=$(sed -n "s/^# installer-release: //p" install-custom/install.sh)
           [[ -n "$installer_tag" ]] || { echo 'installer-release header missing'; exit 1; }
           cp install-custom/install.sh dist/install-custom-agent.sh
@@ -85,7 +91,7 @@ jobs:
           cp agent/THIRD-PARTY-NOTICES.txt dist/THIRD-PARTY-NOTICES.txt
           git archive --format=zip --prefix="cfsm-agent-${version}/" -o "dist/cfsm-agent-${version}-source.zip" HEAD:agent
           (cd dist && rm -f binaries.sha256 && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt)
-          gh release create "agent-${version}" --verify-tag --title "Custom agent ${version}" \
+          gh release create "agent-${version}" --target "${GITHUB_SHA}" --title "Custom agent ${version}" \
             --notes "Custom cf-probe ${version} for CF-Server-Monitor latency detail. Install with the admin copy command (installer ${installer_tag}); do not replace with upstream binaries." \
             dist/*
           mkdir -p installer
