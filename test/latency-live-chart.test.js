@@ -94,6 +94,11 @@ test('live samples draw within seconds, merge with history and the axis keeps sp
     const lossLabel = charts[1].options.plugins.tooltip.callbacks.label({ dataset: { label: '测试线路' }, raw: atSpike(), parsed: { y: atSpike().y } });
     assert.match(lossLabel, /失败 0 次，重传 1 次/);
 
+    // A success between two failures is drawn as a dot.
+    assert.equal(pingLine().pointRadius({ dataset: { data: [{ y: null }, { y: 80 }, { y: null }] }, dataIndex: 1 }), 1.6);
+    assert.equal(pingLine().pointRadius({ dataset: { data: [{ y: 70 }, { y: 80 }, { y: null }] }, dataIndex: 1 }), 0);
+    assert.equal(pingLine().pointRadius({ dataset: { data: [{ y: null }] }, dataIndex: 0 }), 0);
+
     // Live samples: appear immediately at the right edge, without waiting for the minute upload.
     assert.match(text(root), /每分钟刷新 · 最新/);
     clock += 10000;

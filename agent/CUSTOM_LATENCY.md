@@ -10,6 +10,8 @@ latency.3 新增实时回显：每次已有的上报（WSS 或 POST）在 metric
 
 latency.4：资源上报使用的 TCP 探测把握手超时设为 900 ms，低于 Linux 首个 SYN 的 1 秒重传定时器。此前 1.5 秒超时会把一次丢失的 SYN 记成约 1000+ ms 的“成功”；现在每个读数都来自首个 SYN 完成的握手，丢失的 SYN 记为失败（丢包）。DNS 解析仍沿用 1.5 秒，解析慢不会被记成丢包。真实往返超过 900 ms 的目标会显示为不可达。ICMP 与任务探测不变。
 
+latency.5：实时回显覆盖最近 150 秒（内存最多 180 秒/72 条），分钟块改为每分钟结束后约 3 秒上传（原为相位随机的每分钟定时器，最长滞后近 2 分钟）。页面任意时刻打开时，已存历史与实时回显之间不再有空档。不新增请求。
+
 源码现位于 Worker 仓库 agent/ 目录，由 .github/workflows/custom-agent.yml 在 GitHub Actions 中测试和交叉编译（-trimpath -buildvcs=false，可重复构建），推送 agent-<版本> tag 时核对安装脚本中的 SHA256 后发布 Release。
 
 必须先部署配套 Worker、执行新增表 SQL、在 Worker 变量 LATENCY_DETAIL_SERVER_IDS 中加入本机 UUID，才启用本功能。

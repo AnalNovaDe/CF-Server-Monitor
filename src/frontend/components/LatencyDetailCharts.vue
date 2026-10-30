@@ -86,7 +86,8 @@ const loader = createLatencyHistoryLoader({
   paused: () => document.hidden,
   onChange: state => { history.value = state },
   onPage: async () => {
-    clock.value = Date.now()
+    const newestSample = history.value.samples?.at(-1)?.t
+    clock.value = Math.max(Date.now(), Number.isFinite(newestSample) ? newestSample : 0)
     lastRefresh.value = clock.value
     await nextTick()
     if (disposed) return
@@ -216,7 +217,8 @@ function draw() {
       ? rawLoss.map(point => point.attempts ? { ...point, y: 100 * (point.failed + point.retrans) / point.attempts } : point)
       : rawLoss
     const common={label:props.labels[i]||`Node ${i+1}`,borderColor:colors[i],backgroundColor:colors[i],borderWidth:1,pointRadius:0,tension:0,spanGaps:false}
-    p.push({...common,data:pingPoints,hidden:pingHidden.value.includes(i)})
+    // A success between two failures has no neighbour to draw a line to: show it as a dot.
+    p.push({...common,data:pingPoints,hidden:pingHidden.value.includes(i),pointRadius:isolatedRadius,pointHoverRadius:3})
     if (cap !== null) {
       const over = pingPoints.filter(point => point.raw !== undefined)
       if (over.length) markers.push({...common,type:'scatter',isMarker:true,data:over,pointStyle:'triangle',pointRadius:3.5,pointHoverRadius:5,borderWidth:0,showLine:false,hidden:pingHidden.value.includes(i)})
@@ -233,6 +235,11 @@ function draw() {
   else {ping.data.datasets=pingSets;ping.options=options(false);ping.update('none')}
   if (!loss) loss=new Chart(lossCanvas.value,{type:'line',data:{datasets:l},options:options(true),plugins:[pendingHistory]})
   else {loss.data.datasets=l;loss.options=options(true);loss.update('none')}
+}
+function isolatedRadius(ctx) {
+  const data = ctx.dataset.data, i = ctx.dataIndex
+  if (data[i]?.y == null) return 0
+  return data[i - 1]?.y == null && data[i + 1]?.y == null ? 1.6 : 0
 }
 function scheduleDraw() {
   if (drawFrame || disposed) return

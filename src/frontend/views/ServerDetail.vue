@@ -401,6 +401,7 @@ import { ref, computed, inject, onMounted, onUnmounted, watch, nextTick, h } fro
 import { useRoute, useRouter } from 'vue-router'
 import TerminalHeader from '../components/TerminalHeader.vue'
 import LatencyDetailCharts from '../components/LatencyDetailCharts.vue'
+import { trimToWindow, mergeCachedPoints } from '../utils/chartWindow.js'
 import Footer from '../components/Footer.vue'
 import OsIcon from '../components/OsIcon.vue'
 import LiveConnectionTimeoutModal from '../components/LiveConnectionTimeoutModal.vue'
@@ -896,6 +897,50 @@ const formatChartAxisTime = (value) => {
   return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${time}`
 }
 
+// 定制：实时（10 分钟）视图里每 2 秒追加的点只在内存中，D1 只存每分钟一条。
+// 按标签页缓存在 sessionStorage，刷新后恢复，高精度曲线不会变回每分钟一点的平滑线。
+const LIVE_CHART_CACHE_MAX_AGE = 15 * 60 * 1000
+const liveChartCacheKey = () => `cfsm-live-charts:${serverId}`
+let liveChartCacheSavedAt = 0
+const saveLiveChartCache = () => {
+  if (!chartsReady.value || !isRealtimeHistoryRange()) return
+  try {
+    const since = Date.now() - currentHours.value * 60 * 60 * 1000 - 60000
+    const payload = { savedAt: Date.now(), charts: {} }
+    for (const [key, chart] of Object.entries(charts)) {
+      if (!chart?.data?.datasets) continue
+      payload.charts[key] = chart.data.datasets.map(dataset => ({
+        label: dataset.label,
+        data: (dataset.data || []).filter(point => getChartTimestamp(point) >= since).map(point => [getChartTimestamp(point), point.y ?? null])
+      }))
+    }
+    sessionStorage.setItem(liveChartCacheKey(), JSON.stringify(payload))
+    liveChartCacheSavedAt = payload.savedAt
+  } catch (_) {}
+}
+const saveLiveChartCacheThrottled = () => {
+  if (Date.now() - liveChartCacheSavedAt >= 20000) saveLiveChartCache()
+}
+const restoreLiveChartCache = () => {
+  if (!isRealtimeHistoryRange()) return
+  let payload = null
+  try { payload = JSON.parse(sessionStorage.getItem(liveChartCacheKey()) || 'null') } catch (_) { return }
+  if (!payload || !payload.charts || Date.now() - Number(payload.savedAt) > LIVE_CHART_CACHE_MAX_AGE) return
+  const startTime = Date.now() - currentHours.value * 60 * 60 * 1000
+  for (const [key, cachedSets] of Object.entries(payload.charts)) {
+    const chart = charts[key]
+    if (!chart?.data?.datasets || !Array.isArray(cachedSets)) continue
+    chart.data.datasets.forEach((dataset, index) => {
+      const cached = cachedSets[index]
+      if (!cached || cached.label !== dataset.label || !Array.isArray(cached.data)) return
+      // 缓存覆盖的时段用缓存的高精度点，其余时段沿用历史
+      dataset.data = mergeCachedPoints(dataset.data, trimToWindow(cached.data.map(([x, y]) => createChartPoint(x, y)), startTime))
+    })
+    syncChartLabels(chart)
+    chart.update('none')
+  }
+}
+
 // 定制：固定宽度的时间窗 [现在 - 所选时长, 现在]。实时追加时左端随之右移，
 // 超出窗口的点由 appendDataToChart 丢弃，波形持续向左平移而不是在左侧“折叠”。
 const syncChartLabels = (chart) => {
@@ -1367,7 +1412,17 @@ const clearDiskIoChart = () => {
 
 const loadAllHistory = async (hours) => {
   try {
-    const allData = await fetchAllHistory(serverId, hours, apiIndex.value)
+    // 定制：10 分钟视图取 30 分钟历史（接口只接受固定档位），只保留窗口内及窗口前一行，
+    // 否则第一条历史常落在窗口起点之后，左侧留白。
+    const realtimeRange = Math.abs(Number(hours) - REALTIME_HISTORY_HOURS) < 0.001
+    const fetchedData = await fetchAllHistory(serverId, realtimeRange ? 0.5 : hours, apiIndex.value)
+    const allData = realtimeRange
+      ? trimToWindow(
+        [...fetchedData].sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
+          .map(row => ({ ...row, x: new Date(row.timestamp).getTime() })),
+        Date.now() - hours * 60 * 60 * 1000
+      )
+      : fetchedData
     lastReportChartUpdateTime = 0
     lossHistoryFields.value = Object.fromEntries(PING_FIELD_DEFS.map(item => [
       item.lossField,
@@ -1454,6 +1509,7 @@ const loadAllHistory = async (hours) => {
     }
 
     updateAllChartTimeUnits(hours)
+    restoreLiveChartCache()
     historyLoaded.value = true
 
     await nextTick()
@@ -1528,8 +1584,9 @@ const appendDataToChart = (chart, datasetIndex, timestamp, value, isPing = false
     dataset.data.shift()
   }
   
-  dataset.data = dataset.data.filter(d => getChartTimestamp(d) >= startTime)
+  dataset.data = trimToWindow(dataset.data, startTime)
   syncChartLabels(chart)
+  saveLiveChartCacheThrottled()
   
   chart.update('none')
 }
@@ -1557,7 +1614,7 @@ const appendLoadChartData = (timestamp, loadAvg) => {
     while (chart.data.datasets[i].data.length > CHART.MAX_DATA_POINTS) {
       chart.data.datasets[i].data.shift()
     }
-    chart.data.datasets[i].data = chart.data.datasets[i].data.filter(d => getChartTimestamp(d) >= startTime)
+    chart.data.datasets[i].data = trimToWindow(chart.data.datasets[i].data, startTime)
   }
 
   syncChartLabels(chart)
@@ -1848,6 +1905,7 @@ const initChartsOnMount = async () => {
 }
 
 const handleVisibility = () => {
+  if (document.hidden) saveLiveChartCache()
   if (!liveSocket) return
   if (document.hidden) {
     clearLatestReportReplayTimers()
@@ -1925,6 +1983,7 @@ const init = async () => {
   }, apiIndex.value)
 
   document.addEventListener('visibilitychange', handleVisibility)
+  window.addEventListener('pagehide', saveLiveChartCache)
 }
 
 watch([cpuChartRef, gpuChartRef, gpuMemChartRef, gpuClockChartRef, gpuPowerChartRef, ramChartRef, diskChartRef, diskIoChartRef, netChartRef, procChartRef, connChartRef, pingChartRef, lossChartRef, loadChartRef], () => {
@@ -1938,6 +1997,8 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  saveLiveChartCache()
+  window.removeEventListener('pagehide', saveLiveChartCache)
   document.removeEventListener('visibilitychange', handleVisibility)
   if (liveSocket) liveSocket.close()
   clearLatestReportReplayTimers()
