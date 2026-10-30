@@ -16,11 +16,13 @@
         {{ en ? 'Loaded samples' : '已加载记录（含失败）' }}: {{ samples.length }} · {{ en ? 'Newest' : '最新测量' }}: {{ newest }} · {{ en ? 'History refreshed' : '历史刷新于' }}: {{ refreshedAt }}</p>
       <div class="route-buttons" role="group" :aria-label="en ? 'Latency route visibility' : '延迟线路显示'">
         <button v-for="i in available" :key="i" class="btn" :style="{ color: colors[i], opacity: pingHidden.includes(i) ? .4 : 1 }" :aria-pressed="!pingHidden.includes(i)" @click="toggleRoute(i)">{{ labels[i] || `Node ${i+1}` }}</button>
+        <button class="btn axis-toggle" :class="{ active: fullAxis }" :aria-pressed="fullAxis" @click="fullAxis = !fullAxis">{{ fullAxis ? (en ? 'Full axis' : '完整纵轴') : (en ? 'Adaptive axis' : '自适应纵轴') }}</button>
       </div>
+      <p v-if="pingCap" class="detail-note">{{ en ? `Axis capped at ${pingCap} ms; ▲ marks samples above it (hover for the real value).` : `纵轴封顶 ${pingCap} ms，▲ 表示超出的测量（悬停查看实际值）。` }}<template v-if="protocol === 'TCP'">{{ en ? ' ≥1000 ms usually means the first SYN was lost and retransmitted.' : ' ≥1000 ms 通常是首个 SYN 丢失后 1 秒重传。' }}</template></p>
       <p v-if="!samples.length && history.complete" class="detail-note">{{ en ? 'No measurements in the loaded 24h. Check Agent uploads; earlier detailed samples cannot be reconstructed.' : '最近 24h 已读取完毕，未找到测量记录；请检查 Agent 上报。启用前的高精度历史无法补回。' }}</p>
       <div class="dense-chart"><canvas ref="pingCanvas" :aria-label="en ? 'Raw latency chart' : '逐次延迟图'" role="img"></canvas></div>
       <div class="time-slider">
-        <span class="follow-state">{{ offsetMinutes === 0 ? (en ? 'Following latest · refreshes every minute' : '跟随最新 · 每分钟自动刷新') : (en ? 'Reviewing a fixed history window' : '正在回看固定历史时段') }}</span>
+        <span class="follow-state">{{ offsetMinutes === 0 ? followText : (en ? 'Reviewing a fixed history window' : '正在回看固定历史时段') }}</span>
         <template v-if="hours < 24">
           <label>{{ en ? 'History offset' : '向前回看' }} <input :aria-label="en ? 'Latency history offset in minutes' : '延迟回看偏移分钟'" type="range" min="0" :max="1440-hours*60" step="5" :value="offsetMinutes" @input="setOffset($event.target.value)" /></label>
           <button v-if="offsetMinutes > 0" class="btn" @click="setOffset(0)">{{ en ? 'Back to latest' : '回到最新' }}</button>
@@ -41,10 +43,11 @@
     <p class="detail-note">{{ en ? 'Route visibility, time range and history controls are independent for this chart. Click a route to hide or show it; measurements continue. Loss still uses a 5-minute window.' : '本图的线路显隐、显示范围和回看时段均独立；点击线路名称可隐藏或显示，测量仍继续。丢包率按最近 5 分钟统计。' }}</p>
     <div class="route-buttons" role="group" :aria-label="en ? 'Loss route visibility' : '丢包率线路显示'">
       <button v-for="i in available" :key="i" class="btn" :style="{ color: colors[i], opacity: lossHidden.includes(i) ? .4 : 1 }" :aria-pressed="!lossHidden.includes(i)" @click="toggleRoute(i, true)">{{ labels[i] || `Node ${i+1}` }}</button>
+      <button v-if="protocol === 'TCP'" class="btn axis-toggle" :class="{ active: includeRetrans }" :aria-pressed="includeRetrans" @click="includeRetrans = !includeRetrans">{{ en ? 'Count SYN retransmits' : '计入 SYN 重传' }}</button>
     </div>
     <div class="dense-chart loss"><canvas ref="lossCanvas" :aria-label="lossTitle" role="img"></canvas></div>
     <div class="time-slider">
-      <span class="follow-state">{{ lossOffsetMinutes === 0 ? (en ? 'Following latest · refreshes every minute' : '跟随最新 · 每分钟自动刷新') : (en ? 'Reviewing a fixed history window' : '正在回看固定历史时段') }}</span>
+      <span class="follow-state">{{ lossOffsetMinutes === 0 ? followText : (en ? 'Reviewing a fixed history window' : '正在回看固定历史时段') }}</span>
       <template v-if="lossHours < 24">
         <label>{{ en ? 'History offset' : '向前回看' }} <input :aria-label="en ? 'Loss history offset in minutes' : '丢包率回看偏移分钟'" type="range" min="0" :max="1440-lossHours*60" step="5" :value="lossOffsetMinutes" @input="setLossOffset($event.target.value)" /></label>
         <button v-if="lossOffsetMinutes > 0" class="btn" @click="setLossOffset(0)">{{ en ? 'Back to latest' : '回到最新' }}</button>
@@ -60,9 +63,9 @@ import { ref, shallowRef, computed, watch, nextTick, onMounted, onUnmounted } fr
 import Chart from 'chart.js/auto'
 import { http } from '../utils/http'
 import { currentLang } from '../utils/i18n'
-import { latencyChartSeries } from '../utils/latencyDetail.js'
+import { latencyChartSeries, latencyAxisCap, RETRANSMIT_MS } from '../utils/latencyDetail.js'
 import { createLatencyHistoryLoader } from '../utils/latencyHistory.js'
-const props = defineProps({ serverId: String, apiIndex: { type: Number, default: 0 }, labels: { type: Array, default: () => [] }, selectedHours: { type: Number, default: 24 }, probeMode: { type: String, default: 'tcp' } })
+const props = defineProps({ serverId: String, apiIndex: { type: Number, default: 0 }, labels: { type: Array, default: () => [] }, selectedHours: { type: Number, default: 24 }, probeMode: { type: String, default: 'tcp' }, liveSamples: { type: Array, default: null } })
 const emit = defineEmits(['active', 'update:selectedHours'])
 const timeOptions = [
   { hours: 1/6, label: '10M' },
@@ -85,6 +88,7 @@ const pingHidden = ref([]), lossHidden = ref([])
 const hours = ref(24), offsetMinutes = ref(0), historyAnchor = ref(null), clock = ref(Date.now()), pingCanvas = ref(null), lossCanvas = ref(null)
 const lossHours = ref(24), lossOffsetMinutes = ref(0), lossHistoryAnchor = ref(null)
 const lastRefresh = ref(null)
+const fullAxis = ref(false), includeRetrans = ref(false), pingCap = ref(null)
 const colors = ['#00a58b','#e49b40','#4da6ff','#b392f0','#ff7b72','#79c0ff','#60ba66','#fa8a44']
 let ping, loss, timer, disposed = false, observer, drawFrame
 const history = shallowRef({})
@@ -108,6 +112,10 @@ const error = computed(() => history.value.error ? (en.value ? 'History loading 
 const available = computed(() => [...new Set(samples.value.map(s => s.p))].sort())
 const newest = computed(() => samples.value.length ? new Date(samples.value.at(-1).t).toLocaleString() : '—')
 const refreshedAt = computed(() => lastRefresh.value ? new Date(lastRefresh.value).toLocaleTimeString() : '—')
+const liveActive = computed(() => !!history.value.liveAt && clock.value - history.value.liveAt < 90000)
+const followText = computed(() => liveActive.value
+  ? (en.value ? 'Following latest · live (new raw samples within seconds)' : '跟随最新 · 实时（原始测量数秒内上图）')
+  : (en.value ? 'Following latest · refreshes every minute' : '跟随最新 · 每分钟自动刷新'))
 const endLabel = computed(() => new Date(viewEnd.value).toLocaleString())
 const viewEnd = computed(() => (historyAnchor.value ?? clock.value) - offsetMinutes.value * 60000)
 const viewStart = computed(() => viewEnd.value - hours.value * 3600000)
@@ -192,22 +200,41 @@ function draw() {
   const lossEnd = lossViewEnd.value, lossStart = lossViewStart.value
   let maxLoss = 0
   const options = (isLoss) => ({ responsive:true, maintainAspectRatio:false, animation:false, parsing:false,
-    interaction:{ mode:'nearest',intersect:false }, plugins:{ legend:{display:false}, tooltip:{ callbacks:{ title: items=>items.length ? new Date(items[0].parsed.x).toLocaleString() : '', label:item=> {
-      let label = `${item.dataset.label}: ${Number(item.parsed.y).toFixed(isLoss?1:0)}${isLoss?'%':' ms'}`
+    interaction:{ mode:'nearest',intersect:false }, plugins:{ legend:{display:false}, tooltip:{ filter: item => !item.dataset.isMarker, callbacks:{ title: items=>items.length ? new Date(items[0].parsed.x).toLocaleString() : '', label:item=> {
+      const value = item.raw.raw ?? item.parsed.y
+      let label = `${item.dataset.label}: ${Number(value).toFixed(isLoss?1:0)}${isLoss?'%':' ms'}`
+      if (!isLoss && protocol.value === 'TCP' && value >= RETRANSMIT_MS) label += en.value ? ' (likely SYN retransmit)' : '（疑似 SYN 重传）'
       if (isLoss && item.raw.attempts) {
-        const failed = Math.round(item.parsed.y * item.raw.attempts / 100)
-        label += en.value ? ` (${failed}/${item.raw.attempts} failed)` : `（${item.raw.attempts} 次中失败 ${failed} 次）`
+        label += en.value ? ` (${item.raw.failed}/${item.raw.attempts} failed` : `（${item.raw.attempts} 次中失败 ${item.raw.failed} 次`
+        if (protocol.value === 'TCP') label += en.value ? `, ${item.raw.retrans} retransmitted)` : `，重传 ${item.raw.retrans} 次）`
+        else label += en.value ? ')' : '）'
       }
       return label
     } } } },
-    scales:{ x:{ type:'linear',min:isLoss?lossStart:start,max:isLoss?lossEnd:end,grid:{color:grid},ticks:{color:text,maxTicksLimit:8,minRotation:0,maxRotation:0,callback:v=>new Date(v).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})} },y:{min:isLoss?0:undefined,max:isLoss?Math.min(100,Math.max(10,Math.ceil(maxLoss*1.1/5)*5)):undefined,grid:{color:grid},ticks:{color:text},title:{display:true,text:isLoss?'%':'ms',color:text}} }
+    scales:{ x:{ type:'linear',min:isLoss?lossStart:start,max:isLoss?lossEnd:end,grid:{color:grid},ticks:{color:text,maxTicksLimit:8,minRotation:0,maxRotation:0,callback:v=>new Date(v).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})} },y:{min:isLoss?0:undefined,max:isLoss?Math.min(100,Math.max(10,Math.ceil(maxLoss*1.1/5)*5)):(cap ?? undefined),grid:{color:grid},ticks:{color:text},title:{display:true,text:isLoss?'%':'ms',color:text}} }
   })
-  const p=[],l=[]
+  const p=[],l=[],markers=[]
+  // Adaptive axis from the visible routes in the visible range.
+  const visibleValues = []
   for (const i of available.value) {
-    const pingPoints=chartSeries.value.get(i)?.ping || []
-    const lossPoints=lossChartSeries.value.get(i)?.loss || []
+    if (pingHidden.value.includes(i)) continue
+    for (const point of chartSeries.value.get(i)?.ping || []) if (point.x >= start && point.x <= end && point.y !== null) visibleValues.push(point.y)
+  }
+  const cap = fullAxis.value ? null : latencyAxisCap(visibleValues)
+  pingCap.value = cap
+  for (const i of available.value) {
+    const rawPing=chartSeries.value.get(i)?.ping || []
+    const pingPoints=cap === null ? rawPing : rawPing.map(point => point.y !== null && point.y > cap ? { x: point.x, y: cap, raw: point.y } : point)
+    const rawLoss=lossChartSeries.value.get(i)?.loss || []
+    const lossPoints=includeRetrans.value && protocol.value === 'TCP'
+      ? rawLoss.map(point => point.attempts ? { ...point, y: 100 * (point.failed + point.retrans) / point.attempts } : point)
+      : rawLoss
     const common={label:props.labels[i]||`Node ${i+1}`,borderColor:colors[i],backgroundColor:colors[i],borderWidth:1,pointRadius:0,tension:0,spanGaps:false}
     p.push({...common,data:pingPoints,hidden:pingHidden.value.includes(i)})
+    if (cap !== null) {
+      const over = pingPoints.filter(point => point.raw !== undefined)
+      if (over.length) markers.push({...common,type:'scatter',isMarker:true,data:over,pointStyle:'triangle',pointRadius:3.5,pointHoverRadius:5,borderWidth:0,showLine:false,hidden:pingHidden.value.includes(i)})
+    }
     l.push({...common,borderWidth:1.5,data:lossPoints,hidden:lossHidden.value.includes(i)})
     if (!lossHidden.value.includes(i)) {
       for (const point of lossPoints) {
@@ -215,8 +242,9 @@ function draw() {
       }
     }
   }
-  if (!ping) ping=new Chart(pingCanvas.value,{type:'line',data:{datasets:p},options:options(false),plugins:[pendingHistory]})
-  else {ping.data.datasets=p;ping.options=options(false);ping.update('none')}
+  const pingSets=[...p,...markers]
+  if (!ping) ping=new Chart(pingCanvas.value,{type:'line',data:{datasets:pingSets},options:options(false),plugins:[pendingHistory]})
+  else {ping.data.datasets=pingSets;ping.options=options(false);ping.update('none')}
   if (!loss) loss=new Chart(lossCanvas.value,{type:'line',data:{datasets:l},options:options(true),plugins:[pendingHistory]})
   else {loss.data.datasets=l;loss.options=options(true);loss.update('none')}
 }
@@ -228,13 +256,20 @@ const load = () => loader.load()
 const onVisibility = () => {
   if (!document.hidden && (!history.value.complete || lastRefresh.value === null || Date.now() - lastRefresh.value >= 60000)) load()
 }
+watch(() => props.liveSamples, live => {
+  if (!loader.addLive(live)) return
+  const newest = Math.max(...live.map(s => s.t))
+  // Advance the "following latest" window so new points are not clipped at the old edge.
+  clock.value = Math.max(Date.now(), Number.isFinite(newest) ? newest : 0)
+  scheduleDraw()
+})
 watch(enabled, active => { emit('active', active); if (!active) destroyCharts() })
-watch([hours,offsetMinutes,historyAnchor,lossHours,lossOffsetMinutes,lossHistoryAnchor,pingHidden,lossHidden,()=>props.labels,protocol,currentLang], scheduleDraw, { flush:'post' })
+watch([hours,offsetMinutes,historyAnchor,lossHours,lossOffsetMinutes,lossHistoryAnchor,pingHidden,lossHidden,fullAxis,includeRetrans,()=>props.labels,protocol,currentLang], scheduleDraw, { flush:'post' })
 onMounted(()=>{load();timer=setInterval(load,60000);document.addEventListener('visibilitychange',onVisibility);observer=new MutationObserver(scheduleDraw);observer.observe(document.body,{attributes:true,attributeFilter:['class']})})
 onUnmounted(()=>{disposed=true;loader.dispose();clearInterval(timer);cancelAnimationFrame(drawFrame);document.removeEventListener('visibilitychange',onVisibility);observer?.disconnect();destroyCharts()})
 </script>
 
 <style scoped>
-.latency-detail{grid-column:1 / -1;min-width:0}.dense-chart{position:relative;height:350px;padding:12px 18px}.dense-chart.loss{height:230px}.detail-note{font-size:12px;line-height:1.7;padding:4px 18px;opacity:.85;overflow-wrap:anywhere}.range-buttons,.route-buttons{display:flex;gap:8px;flex-wrap:wrap}.route-buttons{padding:0 18px}.btn.active{background:var(--accent-color,#158064);color:white}.time-slider{display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:12px 18px;font-size:12px}.time-slider label{display:flex;align-items:center;gap:12px;flex:1}.time-slider input{flex:1;min-width:80px}@media(max-width:600px){.dense-chart{height:280px;padding:8px}.chart-card-header{flex-wrap:wrap;gap:8px}.detail-note{padding:4px 12px}}
+.latency-detail{grid-column:1 / -1;min-width:0}.dense-chart{position:relative;height:350px;padding:12px 18px}.dense-chart.loss{height:230px}.detail-note{font-size:12px;line-height:1.7;padding:4px 18px;opacity:.85;overflow-wrap:anywhere}.range-buttons,.route-buttons{display:flex;gap:8px;flex-wrap:wrap}.route-buttons{padding:0 18px}.btn.active{background:var(--accent-color,#158064);color:white}.axis-toggle{margin-left:auto}.time-slider{display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:12px 18px;font-size:12px}.time-slider label{display:flex;align-items:center;gap:12px;flex:1}.time-slider input{flex:1;min-width:80px}@media(max-width:600px){.dense-chart{height:280px;padding:8px}.chart-card-header{flex-wrap:wrap;gap:8px}.detail-note{padding:4px 12px}}
 .history-status{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.history-status progress{width:140px;height:8px;accent-color:var(--accent-color,#158064)}
 </style>

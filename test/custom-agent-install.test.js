@@ -54,7 +54,7 @@ test('installation readiness enforces auth, six-node opt-in, server existence an
   clearServersListCache();storage=true;
   const ready=await handleLatencyInstallCheck(request(),env);
   assert.equal(ready.status,200);
-  assert.deepEqual(await ready.json(),{enabled:true,version:'1.0.19-latency.2'});
+  assert.deepEqual(await ready.json(),{enabled:true,version:'1.0.19-latency.3'});
   assert.ok(queries.every(sql=>sql.startsWith('SELECT ')));
   clearServersListCache();
 });
@@ -87,7 +87,7 @@ test('Linux installer enables boot startup and restores files, running state and
     const executable=async(name,source)=>{const path=join(tools,name);await writeFile(path,source);await chmod(path,0o700);return path;};
     const fakeAgent=await executable('fake-agent',`#!/bin/bash
 set -eu
-if [[ $1 == version ]]; then echo 'CF-Server-Monitor Go Probe 1.0.19-latency.2'; exit; fi
+if [[ $1 == version ]]; then echo 'CF-Server-Monitor Go Probe 1.0.19-latency.3'; exit; fi
 # The real Agent install stops AND disables the old unit, even with --no-start.
 mode=(); [[ $CFM_TEST_MODE != user ]] || mode=(--user)
 systemctl "\${mode[@]}" stop cf-probe.service
@@ -111,7 +111,7 @@ for arg in "$@"; do
 done
 if [[ $request == check ]]; then
   if [[ \${CFM_TEST_HTML:-0} == 1 ]]; then echo '<html>old frontend</html>' > "$out"
-  else echo '{"enabled":true,"version":"1.0.19-latency.2"}' > "$out"; fi
+  else echo '{"enabled":true,"version":"1.0.19-latency.3"}' > "$out"; fi
   printf '%s' "\${CFM_TEST_STATUS:-200}"
 else cp ${shellQuote(fakeAgent)} "$out"; fi
 `);
@@ -154,7 +154,7 @@ esac
         .replaceAll('/etc/config/cf-probe/config.conf',mode==='system'?conf:join(root,'unused-system-config'))
         .replaceAll('/usr/local/bin/cf-probe',binary)
         .replaceAll('/etc/systemd/system/cf-probe.service',unit)
-        .replaceAll(/(?:f6986f1a33ec7d7ce69215c6768e74c704317a777f2ebc1983d129b4e6835aae|dccc28a3f6eaab789d7484992520f2930e5862cc62de216710407c1ff02d4f14)/g,fakeHash);
+        .replace(/(cfm_arch=(?:amd64|arm64); cfm_sha=)[a-f0-9]{64}/g,`$1${fakeHash}`);
       const file=join(modeHome,'install.sh');await writeFile(file,script);
       const env={...process.env,HOME:modeHome,PATH:`${tools}:${process.env.PATH}`,CFM_TEST_MODE:mode,CFM_TEST_CONF:conf,CFM_TEST_BIN:binary,CFM_TEST_UNIT:unit};
       const args=[file,`-id=${id}`,'-secret=test-secret','-url=https://test/update'];

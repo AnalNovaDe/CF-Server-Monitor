@@ -1,4 +1,4 @@
-import { mergeLatencySamples } from './latencyDetail.js';
+import { mergeLatencySamples, sampleKey } from './latencyDetail.js';
 
 const MINUTE = 60000;
 const DAY = 1440 * MINUTE;
@@ -82,5 +82,19 @@ export function createLatencyHistoryLoader({ request, onChange, onPage = async (
     }
   }
 
-  return { load, get state() { return state; }, dispose() { disposed = true; } };
+  // Raw samples echoed in realtime reports (latency.3 agents). They are identical to the
+  // later minute-block records, so merging by p:t:k never duplicates or changes them.
+  function addLive(incoming) {
+    if (disposed || state.enabled !== true || !Array.isArray(incoming) || !incoming.length) return false;
+    const recent = new Set(state.samples.slice(-256).map(sampleKey));
+    const fresh = incoming.filter(s => !recent.has(sampleKey(s)));
+    if (!fresh.length) return false;
+    const before = state.samples.length;
+    const samples = mergeLatencySamples(state.samples, fresh, now());
+    if (samples.length === before) return false;
+    publish({ samples, liveAt: now() });
+    return true;
+  }
+
+  return { load, addLive, get state() { return state; }, dispose() { disposed = true; } };
 }

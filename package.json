@@ -16,7 +16,7 @@
     "test:agent-config": "node test/agent-config.js",
     "test:history-query": "node --test test/history-query.test.js",
     "preview": "vite preview",
-    "test:latency": "node --test test/latency-detail.test.js test/latency-history.test.js test/latency-chart-component.test.js test/custom-agent-install.test.js test/live-latency-window.test.js"
+    "test:latency": "node --test test/latency-detail.test.js test/latency-history.test.js test/latency-chart-component.test.js test/custom-agent-install.test.js test/live-latency-window.test.js test/latency-live.test.js test/latency-live-chart.test.js"
   },
   "keywords": [
     "cloudflare",

@@ -1,0 +1,102 @@
+name: Custom agent
+# Tests and cross-compiles the customised cf-probe in agent/.
+# On main (or a pushed agent-<VERSION> tag), if release agent-<VERSION> does not exist yet,
+# it rebuilds, checks the binaries against the SHA256 values pinned in
+# install-custom/install.sh, and publishes the fixed releases used by the admin
+# copy-install command. Builds are reproducible (-trimpath -buildvcs=false).
+on:
+  pull_request:
+    paths: ['agent/**', 'install-custom/**', '.github/workflows/custom-agent.yml']
+  push:
+    branches: [main]
+    paths: ['agent/**', 'install-custom/**', '.github/workflows/custom-agent.yml']
+    tags: ['agent-1.*']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: agent
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: agent/go.mod
+          cache-dependency-path: agent/go.sum
+      - run: go mod verify
+      - run: go vet ./...
+      - run: go test ./...
+      - name: Build linux amd64/arm64
+        run: |
+          set -euo pipefail
+          version=$(cat VERSION)
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath -buildvcs=false \
+              -ldflags "-s -w -X main.version=${version}" -o "dist/cf-probe-linux-${arch}" ./cmd/cf-probe
+          done
+          ./dist/cf-probe-linux-amd64 version
+          (cd dist && sha256sum cf-probe-linux-amd64 cf-probe-linux-arm64 | tee binaries.sha256)
+          while read -r sum file; do echo "::notice title=${file} sha256::${sum}"; done < dist/binaries.sha256
+      - name: Compare with installer pins
+        run: |
+          set -euo pipefail
+          version=$(cat VERSION)
+          installer=../install-custom/install.sh
+          for arch in amd64 arm64; do
+            built=$(awk -v f="cf-probe-linux-${arch}" '$2==f {print $1}' dist/binaries.sha256)
+            if grep -q "cfm_arch=${arch}; cfm_sha=${built} " "$installer" && grep -q "agent-${version}'" "$installer"; then
+              echo "installer pin matches ${arch}: ${built}"
+            else
+              echo "::warning::install-custom/install.sh does not pin ${arch}=${built} for agent-${version}"
+              if [[ "${GITHUB_REF}" == refs/tags/agent-* || "${GITHUB_REF}" == refs/heads/main ]]; then exit 1; fi
+            fi
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cf-probe-linux
+          path: agent/dist/
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/agent-1.') || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: cf-probe-linux
+          path: dist
+      - name: Publish agent and installer releases
+        run: |
+          set -euo pipefail
+          version=$(cat agent/VERSION)
+          if [[ "${GITHUB_REF}" == refs/tags/* && "${GITHUB_REF_NAME}" != "agent-${version}" ]]; then
+            echo "tag ${GITHUB_REF_NAME} != agent-${version}"; exit 1
+          fi
+          if gh release view "agent-${version}" >/dev/null 2>&1; then
+            echo "release agent-${version} already exists; nothing to publish"; exit 0
+          fi
+          installer_tag=$(sed -n "s/^# installer-release: //p" install-custom/install.sh)
+          [[ -n "$installer_tag" ]] || { echo 'installer-release header missing'; exit 1; }
+          cp install-custom/install.sh dist/install-custom-agent.sh
+          cp agent/LICENSE dist/LICENSE-agent.txt
+          cp agent/THIRD-PARTY-NOTICES.txt dist/THIRD-PARTY-NOTICES.txt
+          git archive --format=zip --prefix="cfsm-agent-${version}/" -o "dist/cfsm-agent-${version}-source.zip" HEAD:agent
+          (cd dist && rm -f binaries.sha256 && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt)
+          gh release create "agent-${version}" --target "${GITHUB_SHA}" --title "Custom agent ${version}" \
+            --notes "Custom cf-probe ${version} for CF-Server-Monitor latency detail. Install with the admin copy command (installer ${installer_tag}); do not replace with upstream binaries." \
+            dist/*
+          mkdir -p installer
+          cp install-custom/install.sh installer/install-custom-agent.sh
+          (cd installer && sha256sum install-custom-agent.sh > SHA256SUMS.txt && cat SHA256SUMS.txt)
+          gh release create "${installer_tag}" --target "${GITHUB_SHA}" --title "Custom agent installer ${installer_tag#agent-installer-}" \
+            --notes "Installs agent-${version}. Pinned by SHA256 in the admin copy command." \
+            installer/install-custom-agent.sh installer/SHA256SUMS.txt
