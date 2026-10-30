@@ -390,8 +390,9 @@ export function useServerCardData(props) {
   }
 
   const buildThreeNetRow = (def) => {
-    const customName = props.sysConfig?.[def.nameKey]
-    const label = String(customName || trans.value[def.labelKey] || def.fallbackLabel)
+    // 每台服务器自己的线路名优先（node_N_name 存在 server 上），其次全局设置
+    const customName = props.server?.[def.nameKey] || props.sysConfig?.[def.nameKey]
+    const label = String(customName || (def.labelKey && trans.value[def.labelKey]) || def.fallbackLabel)
     const pingSeries = getLatencySeries('ping', def.key)
     const lossSeries = getLatencySeries('loss', def.key)
     const pointCount = Math.max(pingSeries.length, lossSeries.length, getLatencyWindowPointCount())
@@ -440,8 +441,9 @@ export function useServerCardData(props) {
     for (const def of THREE_NET_DEFS) {
       (isDisabledByLatestLoss(def.key) ? disabled : enabled).push(def)
     }
-    // 启用的节点优先且保持原顺序；不足 3 个时用禁用节点按原顺序补位
-    return [...enabled, ...disabled].slice(0, 3).map(buildThreeNetRow)
+    // 定制：显示全部启用线路（最多 8 路）；不足 3 个时才用禁用节点按原顺序补位
+    const MIN_ROWS = 3
+    return [...enabled, ...disabled.slice(0, Math.max(0, MIN_ROWS - enabled.length))].map(buildThreeNetRow)
   })
 
   const hasThreeNetDetails = computed(() => threeNetDetails.value.length > 0)
