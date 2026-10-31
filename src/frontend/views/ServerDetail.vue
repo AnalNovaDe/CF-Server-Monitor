@@ -906,7 +906,7 @@ const syncChartLabels = (chart) => {
     const last = getLastDatasetTimestamp(dataset.data)
     if (last > newest) newest = last
   }
-  const end = realtimeWindowEnd ?? Math.max(Date.now(), newest)
+  const end = Math.max(Date.now(), newest)
   const hours = currentHours.value
   chart.options.scales.x.min = end - hours * 60 * 60 * 1000
   chart.options.scales.x.max = end
@@ -1427,9 +1427,6 @@ let liveTail = []
 let lastRealtimeFetchAt = 0
 let realtimeRenderFrame = 0
 let realtimeRefreshTimer = null
-// null：窗口右端跟随当前时间；数值：右端停在最新一条入库记录（实时数据尚不完整时）
-let realtimeWindowEnd = null
-const LIVE_TAIL_MAX_LEAD_MS = 6000
 const rowTime = row => new Date(row?.timestamp).getTime()
 const sortRowsByTime = rows => [...(rows || [])].sort((a, b) => rowTime(a) - rowTime(b))
 const lastRealtimeRowTime = () => realtimeRows.length ? rowTime(realtimeRows[realtimeRows.length - 1]) : 0
@@ -1438,15 +1435,12 @@ const renderRealtimeCharts = () => {
   if (!chartsReady.value || !isRealtimeHistoryRange()) return
   const lastRowTs = lastRealtimeRowTime()
   liveTail = liveTail.filter(sample => sample.ts > lastRowTs)
-  // 只有实时数据从上一条入库记录起连续完整时才画“进行中”的点；刚打开页面时缺少这段数据，
-  // 算出的值会和最终入库的不同，所以先停在最新一条记录上，等下一条入库后再开始实时移动。
-  const complete = liveTail.length > 0 && (lastRowTs === 0 || liveTail[0].ts - lastRowTs <= LIVE_TAIL_MAX_LEAD_MS)
-  const live = complete ? aggregateLiveRow(liveTail) : null
-  realtimeWindowEnd = live || lastRowTs === 0 ? null : lastRowTs
-  const end = realtimeWindowEnd ?? Date.now()
+  // 打开页面后立即实时移动：“进行中”的点从打开时起汇总。刚打开的头一分钟里它少了打开前
+  // 那几十秒的数据，数值可能与最终入库的略有差别；这一分钟入库后即被正式的一行替换。
+  const live = aggregateLiveRow(liveTail)
   const rows = trimToWindow(
     [...realtimeRows, ...(live ? [live] : [])].map(row => ({ ...row, x: rowTime(row) })),
-    end - currentHours.value * 60 * 60 * 1000
+    Date.now() - currentHours.value * 60 * 60 * 1000
   )
   if (rows.length > 0) renderHistoryRows(rows)
   Object.values(charts).forEach(chart => {
@@ -1491,7 +1485,6 @@ const loadAllHistory = async (hours) => {
     // 定制：10 分钟视图取 30 分钟历史（接口只接受固定档位），只保留窗口内及窗口前一行，
     // 否则第一条历史常落在窗口起点之后，左侧留白。
     const realtimeRange = Math.abs(Number(hours) - REALTIME_HISTORY_HOURS) < 0.001
-    if (!realtimeRange) realtimeWindowEnd = null
     const fetchedData = await fetchAllHistory(serverId, realtimeRange ? 0.5 : hours, apiIndex.value)
     const allData = realtimeRange
       ? trimToWindow(sortRowsByTime(fetchedData).map(row => ({ ...row, x: rowTime(row) })), Date.now() - hours * 60 * 60 * 1000)
