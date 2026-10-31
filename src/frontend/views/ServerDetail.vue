@@ -401,7 +401,7 @@ import { ref, computed, inject, onMounted, onUnmounted, watch, nextTick, h } fro
 import { useRoute, useRouter } from 'vue-router'
 import TerminalHeader from '../components/TerminalHeader.vue'
 import LatencyDetailCharts from '../components/LatencyDetailCharts.vue'
-import { trimToWindow, mergeCachedPoints, timeTickStep, alignedTicks } from '../utils/chartWindow.js'
+import { trimToWindow, timeTickStep, alignedTicks, aggregateLiveRow } from '../utils/chartWindow.js'
 import Footer from '../components/Footer.vue'
 import OsIcon from '../components/OsIcon.vue'
 import LiveConnectionTimeoutModal from '../components/LiveConnectionTimeoutModal.vue'
@@ -897,52 +897,6 @@ const formatChartAxisTime = (value) => {
   return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${time}`
 }
 
-// 定制：实时（10 分钟）视图里每 2 秒追加的点只在内存中，D1 只存每分钟一条。
-// 按标签页缓存在 sessionStorage，刷新后恢复，高精度曲线不会变回每分钟一点的平滑线。
-const LIVE_CHART_CACHE_MAX_AGE = 15 * 60 * 1000
-const liveChartCacheKey = () => `cfsm-live-charts:${serverId}`
-let liveChartCacheSavedAt = 0
-// 图表当前实际显示的时长（历史加载完成后才更新），缓存只保存 10 分钟视图里的数据
-let renderedChartHours = null
-const saveLiveChartCache = () => {
-  if (!chartsReady.value || Math.abs(Number(renderedChartHours) - REALTIME_HISTORY_HOURS) >= 0.001) return
-  try {
-    const since = Date.now() - REALTIME_HISTORY_HOURS * 60 * 60 * 1000 - 60000
-    const payload = { savedAt: Date.now(), charts: {} }
-    for (const [key, chart] of Object.entries(charts)) {
-      if (!chart?.data?.datasets) continue
-      payload.charts[key] = chart.data.datasets.map(dataset => ({
-        label: dataset.label,
-        data: (dataset.data || []).filter(point => getChartTimestamp(point) >= since).map(point => [getChartTimestamp(point), point.y ?? null])
-      }))
-    }
-    sessionStorage.setItem(liveChartCacheKey(), JSON.stringify(payload))
-    liveChartCacheSavedAt = payload.savedAt
-  } catch (_) {}
-}
-const saveLiveChartCacheThrottled = () => {
-  if (Date.now() - liveChartCacheSavedAt >= 20000) saveLiveChartCache()
-}
-const restoreLiveChartCache = () => {
-  if (!isRealtimeHistoryRange()) return
-  let payload = null
-  try { payload = JSON.parse(sessionStorage.getItem(liveChartCacheKey()) || 'null') } catch (_) { return }
-  if (!payload || !payload.charts || Date.now() - Number(payload.savedAt) > LIVE_CHART_CACHE_MAX_AGE) return
-  const startTime = Date.now() - currentHours.value * 60 * 60 * 1000
-  for (const [key, cachedSets] of Object.entries(payload.charts)) {
-    const chart = charts[key]
-    if (!chart?.data?.datasets || !Array.isArray(cachedSets)) continue
-    chart.data.datasets.forEach((dataset, index) => {
-      const cached = cachedSets[index]
-      if (!cached || cached.label !== dataset.label || !Array.isArray(cached.data)) return
-      // 缓存覆盖的时段用缓存的高精度点，其余时段沿用历史
-      dataset.data = mergeCachedPoints(dataset.data, trimToWindow(cached.data.map(([x, y]) => createChartPoint(x, y)), startTime))
-    })
-    syncChartLabels(chart)
-    chart.update('none')
-  }
-}
-
 // 定制：固定宽度的时间窗 [现在 - 所选时长, 现在]。实时追加时左端随之右移，
 // 超出窗口的点由 appendDataToChart 丢弃，波形持续向左平移而不是在左侧“折叠”。
 const syncChartLabels = (chart) => {
@@ -952,7 +906,7 @@ const syncChartLabels = (chart) => {
     const last = getLastDatasetTimestamp(dataset.data)
     if (last > newest) newest = last
   }
-  const end = Math.max(Date.now(), newest)
+  const end = realtimeWindowEnd ?? Math.max(Date.now(), newest)
   const hours = currentHours.value
   chart.options.scales.x.min = end - hours * 60 * 60 * 1000
   chart.options.scales.x.max = end
@@ -1410,21 +1364,142 @@ const clearDiskIoChart = () => {
   chart.update('none')
 }
 
+// 用若干行（历史行，或历史行加最右端的“进行中”汇总行）填充全部资源图
+const renderHistoryRows = (allData) => {
+  updateChartDataset(charts.cpu, 0, allData, fieldAccessor('cpu', true))
+  rebuildGpuChartDatasets()
+  for (const chartKey of GPU_DETAIL_CHART_KEYS) {
+    const chart = charts[chartKey]
+    if (!chart) continue
+    for (let i = 0; i < chart.data.datasets.length; i++) {
+      const dataset = chart.data.datasets[i]
+      const gpuId = dataset.gpuId
+      const accessor = gpuId ? gpuFieldAccessor(gpuId, chartKey) : () => null
+      updateChartDataset(chart, i, allData, accessor)
+    }
+  }
+  updateChartDataset(charts.ram, 0, allData, percentAccessor('ram_used', 'ram_total'))
+  updateChartDataset(charts.ram, 1, allData, percentAccessor('swap_used', 'swap_total'))
+  updateChartDataset(charts.disk, 0, allData, percentAccessor('disk_used', 'disk_total'))
+  const diskIoRows = allData.filter(hasValidDiskIoPayload)
+  if (diskIoRows.length > 0) {
+    markDiskIoDataAvailable(diskIoRows[0])
+    DISK_IO_FIELDS.forEach((field, index) => {
+      updateChartDataset(charts.diskIo, index, diskIoRows, diskIoAccessor(field))
+    })
+  } else {
+    clearDiskIoChart()
+    hasDiskIoData.value = false
+    if (hasValidDiskIoPayload(server.value) && server.value.last_updated) {
+      appendDiskIoChart(server.value, new Date(server.value.last_updated).getTime())
+    }
+  }
+  updateChartDataset(charts.proc, 0, allData, fieldAccessor('processes'))
+  updateChartDataset(charts.net, 0, allData, fieldAccessor('net_in_speed', true))
+  updateChartDataset(charts.net, 1, allData, fieldAccessor('net_out_speed', true))
+  updateChartDataset(charts.conn, 0, allData, fieldAccessor('tcp_conn', true))
+  updateChartDataset(charts.conn, 1, allData, fieldAccessor('udp_conn', true))
+  updateChartDataset(charts.ping, 0, allData, fieldAccessor('ping_ct', true))
+  updateChartDataset(charts.ping, 1, allData, fieldAccessor('ping_cu', true))
+  updateChartDataset(charts.ping, 2, allData, fieldAccessor('ping_cm', true))
+  updateChartDataset(charts.ping, 3, allData, fieldAccessor('ping_bd', true))
+  updateChartDataset(charts.ping, 4, allData, fieldAccessor('ping_node_1', true))
+  updateChartDataset(charts.ping, 5, allData, fieldAccessor('ping_node_2', true))
+  updateChartDataset(charts.ping, 6, allData, fieldAccessor('ping_node_3', true))
+  updateChartDataset(charts.ping, 7, allData, fieldAccessor('ping_node_4', true))
+  updateChartDataset(charts.loss, 0, allData, fieldAccessor('loss_ct', true))
+  updateChartDataset(charts.loss, 1, allData, fieldAccessor('loss_cu', true))
+  updateChartDataset(charts.loss, 2, allData, fieldAccessor('loss_cm', true))
+  updateChartDataset(charts.loss, 3, allData, fieldAccessor('loss_bd', true))
+  updateChartDataset(charts.loss, 4, allData, fieldAccessor('loss_node_1', true))
+  updateChartDataset(charts.loss, 5, allData, fieldAccessor('loss_node_2', true))
+  updateChartDataset(charts.loss, 6, allData, fieldAccessor('loss_node_3', true))
+  updateChartDataset(charts.loss, 7, allData, fieldAccessor('loss_node_4', true))
+  updateLoadChart(charts.load, allData)
+}
+
+// 定制：10 分钟视图的资源面板只用一个数据来源——数据库里每分钟一条的汇总行
+// （CPU/内存取平均，网络、磁盘 IO、进程、连接取最大）。最右端一个“进行中”的点按同样规则
+// 汇总本分钟已收到的实时数据，每 2 秒更新位置和数值而不是追加新点；新的一行入库后重新取历史
+// 替换它。除最右端外，任何时候、任何设备打开看到的都相同。
+let realtimeRows = []
+let liveTail = []
+let lastRealtimeFetchAt = 0
+let realtimeRenderFrame = 0
+let realtimeRefreshTimer = null
+// null：窗口右端跟随当前时间；数值：右端停在最新一条入库记录（实时数据尚不完整时）
+let realtimeWindowEnd = null
+const LIVE_TAIL_MAX_LEAD_MS = 6000
+const rowTime = row => new Date(row?.timestamp).getTime()
+const sortRowsByTime = rows => [...(rows || [])].sort((a, b) => rowTime(a) - rowTime(b))
+const lastRealtimeRowTime = () => realtimeRows.length ? rowTime(realtimeRows[realtimeRows.length - 1]) : 0
+
+const renderRealtimeCharts = () => {
+  if (!chartsReady.value || !isRealtimeHistoryRange()) return
+  const lastRowTs = lastRealtimeRowTime()
+  liveTail = liveTail.filter(sample => sample.ts > lastRowTs)
+  // 只有实时数据从上一条入库记录起连续完整时才画“进行中”的点；刚打开页面时缺少这段数据，
+  // 算出的值会和最终入库的不同，所以先停在最新一条记录上，等下一条入库后再开始实时移动。
+  const complete = liveTail.length > 0 && (lastRowTs === 0 || liveTail[0].ts - lastRowTs <= LIVE_TAIL_MAX_LEAD_MS)
+  const live = complete ? aggregateLiveRow(liveTail) : null
+  realtimeWindowEnd = live || lastRowTs === 0 ? null : lastRowTs
+  const end = realtimeWindowEnd ?? Date.now()
+  const rows = trimToWindow(
+    [...realtimeRows, ...(live ? [live] : [])].map(row => ({ ...row, x: rowTime(row) })),
+    end - currentHours.value * 60 * 60 * 1000
+  )
+  if (rows.length > 0) renderHistoryRows(rows)
+  Object.values(charts).forEach(chart => {
+    if (!chart) return
+    syncChartLabels(chart)
+    chart.update('none')
+  })
+}
+
+const scheduleRealtimeRender = () => {
+  if (realtimeRenderFrame) return
+  realtimeRenderFrame = requestAnimationFrame(() => {
+    realtimeRenderFrame = 0
+    renderRealtimeCharts()
+  })
+}
+
+const refreshRealtimeRows = async () => {
+  if (!isRealtimeHistoryRange() || document.hidden) return
+  lastRealtimeFetchAt = Date.now()
+  try {
+    const fetched = await fetchAllHistory(serverId, 0.5, apiIndex.value)
+    if (!isRealtimeHistoryRange()) return
+    realtimeRows = sortRowsByTime(fetched)
+    renderRealtimeCharts()
+  } catch (_) {}
+}
+
+const pushLiveSample = (data, ts) => {
+  if (!Number.isFinite(ts) || !data) return
+  const same = liveTail.findIndex(sample => sample.ts === ts)
+  if (same >= 0) liveTail[same] = { ts, data: { ...liveTail[same].data, ...data } }
+  else liveTail.push({ ts, data })
+  if (liveTail.length > 900) liveTail = liveTail.slice(-900)
+  // 本分钟已超过一行的间隔：新的一行应已入库，取一次历史（最多每 20 秒一次）
+  if (Date.now() - lastRealtimeRowTime() > 65000 && Date.now() - lastRealtimeFetchAt > 20000) refreshRealtimeRows()
+  scheduleRealtimeRender()
+}
+
 const loadAllHistory = async (hours) => {
   try {
     // 定制：10 分钟视图取 30 分钟历史（接口只接受固定档位），只保留窗口内及窗口前一行，
     // 否则第一条历史常落在窗口起点之后，左侧留白。
     const realtimeRange = Math.abs(Number(hours) - REALTIME_HISTORY_HOURS) < 0.001
-    // 重新加载历史会替换图表数据：先把正在显示的实时 2 秒点存下来，加载后再恢复
-    saveLiveChartCache()
+    if (!realtimeRange) realtimeWindowEnd = null
     const fetchedData = await fetchAllHistory(serverId, realtimeRange ? 0.5 : hours, apiIndex.value)
     const allData = realtimeRange
-      ? trimToWindow(
-        [...fetchedData].sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
-          .map(row => ({ ...row, x: new Date(row.timestamp).getTime() })),
-        Date.now() - hours * 60 * 60 * 1000
-      )
+      ? trimToWindow(sortRowsByTime(fetchedData).map(row => ({ ...row, x: rowTime(row) })), Date.now() - hours * 60 * 60 * 1000)
       : fetchedData
+    if (realtimeRange) {
+      realtimeRows = sortRowsByTime(fetchedData)
+      lastRealtimeFetchAt = Date.now()
+    }
     lastReportChartUpdateTime = 0
     lossHistoryFields.value = Object.fromEntries(PING_FIELD_DEFS.map(item => [
       item.lossField,
@@ -1436,56 +1511,7 @@ const loadAllHistory = async (hours) => {
         const rowTime = new Date(row.timestamp).getTime()
         return Number.isFinite(rowTime) ? Math.max(latest, rowTime) : latest
       }, 0)
-      updateChartDataset(charts.cpu, 0, allData, fieldAccessor('cpu', true))
-      rebuildGpuChartDatasets()
-      for (const chartKey of GPU_DETAIL_CHART_KEYS) {
-        const chart = charts[chartKey]
-        if (!chart) continue
-        for (let i = 0; i < chart.data.datasets.length; i++) {
-          const dataset = chart.data.datasets[i]
-          const gpuId = dataset.gpuId
-          const accessor = gpuId ? gpuFieldAccessor(gpuId, chartKey) : () => null
-          updateChartDataset(chart, i, allData, accessor)
-        }
-      }
-      updateChartDataset(charts.ram, 0, allData, percentAccessor('ram_used', 'ram_total'))
-      updateChartDataset(charts.ram, 1, allData, percentAccessor('swap_used', 'swap_total'))
-      updateChartDataset(charts.disk, 0, allData, percentAccessor('disk_used', 'disk_total'))
-      const diskIoRows = allData.filter(hasValidDiskIoPayload)
-      if (diskIoRows.length > 0) {
-        markDiskIoDataAvailable(diskIoRows[0])
-        DISK_IO_FIELDS.forEach((field, index) => {
-          updateChartDataset(charts.diskIo, index, diskIoRows, diskIoAccessor(field))
-        })
-      } else {
-        clearDiskIoChart()
-        hasDiskIoData.value = false
-        if (hasValidDiskIoPayload(server.value) && server.value.last_updated) {
-          appendDiskIoChart(server.value, new Date(server.value.last_updated).getTime())
-        }
-      }
-      updateChartDataset(charts.proc, 0, allData, fieldAccessor('processes'))
-      updateChartDataset(charts.net, 0, allData, fieldAccessor('net_in_speed', true))
-      updateChartDataset(charts.net, 1, allData, fieldAccessor('net_out_speed', true))
-      updateChartDataset(charts.conn, 0, allData, fieldAccessor('tcp_conn', true))
-      updateChartDataset(charts.conn, 1, allData, fieldAccessor('udp_conn', true))
-      updateChartDataset(charts.ping, 0, allData, fieldAccessor('ping_ct', true))
-      updateChartDataset(charts.ping, 1, allData, fieldAccessor('ping_cu', true))
-      updateChartDataset(charts.ping, 2, allData, fieldAccessor('ping_cm', true))
-      updateChartDataset(charts.ping, 3, allData, fieldAccessor('ping_bd', true))
-      updateChartDataset(charts.ping, 4, allData, fieldAccessor('ping_node_1', true))
-      updateChartDataset(charts.ping, 5, allData, fieldAccessor('ping_node_2', true))
-      updateChartDataset(charts.ping, 6, allData, fieldAccessor('ping_node_3', true))
-      updateChartDataset(charts.ping, 7, allData, fieldAccessor('ping_node_4', true))
-      updateChartDataset(charts.loss, 0, allData, fieldAccessor('loss_ct', true))
-      updateChartDataset(charts.loss, 1, allData, fieldAccessor('loss_cu', true))
-      updateChartDataset(charts.loss, 2, allData, fieldAccessor('loss_cm', true))
-      updateChartDataset(charts.loss, 3, allData, fieldAccessor('loss_bd', true))
-      updateChartDataset(charts.loss, 4, allData, fieldAccessor('loss_node_1', true))
-      updateChartDataset(charts.loss, 5, allData, fieldAccessor('loss_node_2', true))
-      updateChartDataset(charts.loss, 6, allData, fieldAccessor('loss_node_3', true))
-      updateChartDataset(charts.loss, 7, allData, fieldAccessor('loss_node_4', true))
-      updateLoadChart(charts.load, allData)
+      renderHistoryRows(allData)
 
       const avg = (arr, field, skipZero = true) => {
         const vals = arr.map(d => parseFloat(d[field])).filter(v => !isNaN(v) && (skipZero ? v !== 0 : true))
@@ -1511,8 +1537,7 @@ const loadAllHistory = async (hours) => {
     }
 
     updateAllChartTimeUnits(hours)
-    renderedChartHours = hours
-    restoreLiveChartCache()
+    if (realtimeRange) renderRealtimeCharts()
     historyLoaded.value = true
 
     await nextTick()
@@ -1589,7 +1614,6 @@ const appendDataToChart = (chart, datasetIndex, timestamp, value, isPing = false
   
   dataset.data = trimToWindow(dataset.data, startTime)
   syncChartLabels(chart)
-  saveLiveChartCacheThrottled()
   
   chart.update('none')
 }
@@ -1848,8 +1872,7 @@ const fetchCurrentStatus = async (incomingData, options = {}) => {
 
     if (data.last_updated && chartsReady.value && isRealtimeHistoryRange()) {
       const dataTimestamp = new Date(data.last_updated).getTime()
-      if (chartMode === 'sample' || chartMode === 'all') appendRealtimeSampleCharts(data, dataTimestamp)
-      if (chartMode === 'report' || chartMode === 'all') appendReportChartsThrottled(data, dataTimestamp)
+      pushLiveSample(data, dataTimestamp)
     }
 
     if (data.last_updated) {
@@ -1908,7 +1931,7 @@ const initChartsOnMount = async () => {
 }
 
 const handleVisibility = () => {
-  if (document.hidden) saveLiveChartCache()
+  if (!document.hidden) refreshRealtimeRows()
   if (!liveSocket) return
   if (document.hidden) {
     clearLatestReportReplayTimers()
@@ -1986,7 +2009,9 @@ const init = async () => {
   }, apiIndex.value)
 
   document.addEventListener('visibilitychange', handleVisibility)
-  window.addEventListener('pagehide', saveLiveChartCache)
+  realtimeRefreshTimer = setInterval(() => {
+    if (Date.now() - lastRealtimeFetchAt >= 55000) refreshRealtimeRows()
+  }, 60000)
 }
 
 watch([cpuChartRef, gpuChartRef, gpuMemChartRef, gpuClockChartRef, gpuPowerChartRef, ramChartRef, diskChartRef, diskIoChartRef, netChartRef, procChartRef, connChartRef, pingChartRef, lossChartRef, loadChartRef], () => {
@@ -2000,8 +2025,8 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
-  saveLiveChartCache()
-  window.removeEventListener('pagehide', saveLiveChartCache)
+  clearInterval(realtimeRefreshTimer)
+  if (realtimeRenderFrame) cancelAnimationFrame(realtimeRenderFrame)
   document.removeEventListener('visibilitychange', handleVisibility)
   if (liveSocket) liveSocket.close()
   clearLatestReportReplayTimers()
