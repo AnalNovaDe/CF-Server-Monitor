@@ -2,9 +2,6 @@
   <section v-if="enabled || error || history.enabled === null" class="chart-card full-width latency-detail" :aria-busy="history.busy">
     <div class="chart-card-header">
       <span class="chart-title">▸ {{ en ? 'Latency · raw samples' : '延迟 · 逐次测量' }}</span>
-      <div class="range-buttons" role="group" :aria-label="en ? 'Latency time range' : '延迟时间范围'">
-        <button v-for="option in timeOptions" :key="option.hours" class="btn" :class="{ active: hours === option.hours }" :aria-pressed="hours === option.hours" @click="setRange(option.hours)">{{ option.label }}</button>
-      </div>
     </div>
     <div class="history-status detail-note" role="status" aria-live="polite">
       <span>{{ statusText }}</span>
@@ -31,9 +28,6 @@
   <section v-if="enabled" class="chart-card full-width latency-detail">
     <div class="chart-card-header">
       <span class="chart-title">▸ {{ lossTitle }}</span>
-      <div class="range-buttons" role="group" :aria-label="en ? 'Loss time range' : '丢包率时间范围'">
-        <button v-for="option in timeOptions" :key="option.hours" class="btn" :class="{ active: lossHours === option.hours }" :aria-pressed="lossHours === option.hours" @click="setLossRange(option.hours)">{{ option.label }}</button>
-      </div>
     </div>
     <p class="detail-note">{{ lossNote }}</p>
     <div class="route-buttons" role="group" :aria-label="en ? 'Loss route visibility' : '丢包率线路显示'">
@@ -58,8 +52,8 @@ import { currentLang } from '../utils/i18n'
 import { latencyChartSeries, latencyAxisCap, RETRANSMIT_MS } from '../utils/latencyDetail.js'
 import { createLatencyHistoryLoader } from '../utils/latencyHistory.js'
 import { timeTickStep, alignedTicks } from '../utils/chartWindow.js'
-const props = defineProps({ serverId: String, apiIndex: { type: Number, default: 0 }, labels: { type: Array, default: () => [] }, probeMode: { type: String, default: 'tcp' }, liveSamples: { type: Array, default: null } })
-// The page's range buttons drive the resource charts only; each dense chart keeps its own range.
+const props = defineProps({ serverId: String, apiIndex: { type: Number, default: 0 }, labels: { type: Array, default: () => [] }, rangeHours: { type: Number, default: 24 }, probeMode: { type: String, default: 'tcp' }, liveSamples: { type: Array, default: null } })
+// One range for the whole detail page: both dense charts follow the page's range buttons.
 const emit = defineEmits(['active'])
 const timeOptions = [
   { hours: 1/6, label: '10M' },
@@ -148,6 +142,12 @@ function setLossOffset(value) {
   lossOffsetMinutes.value = offset
 }
 function setLossRange(n) { lossHours.value=n; setLossOffset(0) }
+watch(() => props.rangeHours, value => {
+  // The page uses 0.167 for its 10-minute range.
+  const option = timeOptions.find(option => Math.abs(option.hours - value) < 0.01) || timeOptions[timeOptions.length - 1]
+  setRange(option.hours)
+  setLossRange(option.hours)
+}, { immediate: true })
 function destroyCharts() { ping?.destroy(); loss?.destroy(); ping=undefined; loss=undefined }
 // Mark unread history on the actual plot area, rather than displaying it as a measurement gap.
 const pendingHistory = {

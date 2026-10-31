@@ -326,7 +326,7 @@
         </div>
       </div>
 
-      <LatencyDetailCharts :key="serverId + apiIndex" :server-id="serverId" :api-index="apiIndex" :labels="denseLatencyLabels" :probe-mode="server.ping_mode || 'tcp'" :live-samples="server.latency_live" @active="denseLatencyActive = $event" />
+      <LatencyDetailCharts :key="serverId + apiIndex" :server-id="serverId" :api-index="apiIndex" :labels="denseLatencyLabels" :range-hours="currentHours" :probe-mode="server.ping_mode || 'tcp'" :live-samples="server.latency_live" @active="denseLatencyActive = $event" />
       <div class="chart-card" :class="{ 'full-width': isChartExpanded('ping') }" v-show="hasPingData && !denseLatencyActive">
         <div class="chart-card-header">
           <span class="chart-title">
@@ -401,7 +401,7 @@ import { ref, computed, inject, onMounted, onUnmounted, watch, nextTick, h } fro
 import { useRoute, useRouter } from 'vue-router'
 import TerminalHeader from '../components/TerminalHeader.vue'
 import LatencyDetailCharts from '../components/LatencyDetailCharts.vue'
-import { trimToWindow, timeTickStep, alignedTicks, aggregateLiveRow } from '../utils/chartWindow.js'
+import { trimToWindow, timeTickStep, alignedTicks, aggregateLiveRow, medianSpacing, windowStart } from '../utils/chartWindow.js'
 import Footer from '../components/Footer.vue'
 import OsIcon from '../components/OsIcon.vue'
 import LiveConnectionTimeoutModal from '../components/LiveConnectionTimeoutModal.vue'
@@ -563,9 +563,6 @@ const timeOptions = computed(() => {
     { hours: 6, label: '6h' },
     { hours: 12, label: '12h' },
     { hours: 24, label: '24h' },
-    { hours: 48, label: '2d' },
-    { hours: 96, label: '4d' },
-    { hours: 168, label: '7d' },
   ]
 })
 
@@ -907,7 +904,12 @@ const syncChartLabels = (chart) => {
   }
   const end = Math.max(Date.now(), newest)
   const hours = currentHours.value
-  chart.options.scales.x.min = end - hours * 60 * 60 * 1000
+  let first = Infinity
+  for (const dataset of chart.data.datasets || []) {
+    const point = (dataset.data || []).find(item => item && item.y !== null && item.y !== undefined)
+    if (point) first = Math.min(first, getChartTimestamp(point))
+  }
+  chart.options.scales.x.min = windowStart(end - hours * 60 * 60 * 1000, first, historyRowSpacing)
   chart.options.scales.x.max = end
   // 刻度落在整分/整点上；不强制把窗口两端当作刻度（否则会出现 00:04:01 这类刻度）
   const step = timeTickStep(hours, chart.options.scales.x.ticks?.maxTicksLimit || 6)
@@ -1417,7 +1419,7 @@ const renderHistoryRows = (allData) => {
   updateLoadChart(charts.load, allData)
 }
 
-// 定制：10 分钟视图的资源面板只用一个数据来源——数据库里每分钟一条的汇总行
+// 定制：所有时间档的资源面板都只用一个数据来源——数据库里的汇总行（10M–1H 为每分钟一条）
 // （CPU/内存取平均，网络、磁盘 IO、进程、连接取最大）。最右端一个“进行中”的点按同样规则
 // 汇总本分钟已收到的实时数据，每 2 秒更新位置和数值而不是追加新点；新的一行入库后重新取历史
 // 替换它。除最右端外，任何时候、任何设备打开看到的都相同。
@@ -1426,12 +1428,16 @@ let liveTail = []
 let lastRealtimeFetchAt = 0
 let realtimeRenderFrame = 0
 let realtimeRefreshTimer = null
+let historyRowSpacing = 60000
+// 10M/30M 从更高一档取历史，保证窗口左边界外总有一行；其余档位按本档取
+const historyFetchHours = hours => hours <= REALTIME_HISTORY_HOURS + 0.001 ? 0.5 : (hours <= 0.5 ? 1 : hours)
 const rowTime = row => new Date(row?.timestamp).getTime()
 const sortRowsByTime = rows => [...(rows || [])].sort((a, b) => rowTime(a) - rowTime(b))
 const lastRealtimeRowTime = () => realtimeRows.length ? rowTime(realtimeRows[realtimeRows.length - 1]) : 0
 
 const renderRealtimeCharts = () => {
-  if (!chartsReady.value || !isRealtimeHistoryRange()) return
+  if (!chartsReady.value) return
+  historyRowSpacing = medianSpacing(realtimeRows.map(rowTime)) || 60000
   const lastRowTs = lastRealtimeRowTime()
   liveTail = liveTail.filter(sample => sample.ts > lastRowTs)
   // 打开页面后立即实时移动：“进行中”的点从打开时起汇总。刚打开的头一分钟里它少了打开前
@@ -1458,11 +1464,12 @@ const scheduleRealtimeRender = () => {
 }
 
 const refreshRealtimeRows = async () => {
-  if (!isRealtimeHistoryRange() || document.hidden) return
+  if (document.hidden) return
+  const hours = currentHours.value
   lastRealtimeFetchAt = Date.now()
   try {
-    const fetched = await fetchAllHistory(serverId, 0.5, apiIndex.value)
-    if (!isRealtimeHistoryRange()) return
+    const fetched = await fetchAllHistory(serverId, historyFetchHours(hours), apiIndex.value)
+    if (currentHours.value !== hours) return
     realtimeRows = sortRowsByTime(fetched)
     renderRealtimeCharts()
   } catch (_) {}
@@ -1474,24 +1481,20 @@ const pushLiveSample = (data, ts) => {
   if (same >= 0) liveTail[same] = { ts, data: { ...liveTail[same].data, ...data } }
   else liveTail.push({ ts, data })
   if (liveTail.length > 900) liveTail = liveTail.slice(-900)
-  // 本分钟已超过一行的间隔：新的一行应已入库，取一次历史（最多每 20 秒一次）
-  if (Date.now() - lastRealtimeRowTime() > 65000 && Date.now() - lastRealtimeFetchAt > 20000) refreshRealtimeRows()
+  // 距最新一行已超过一个间隔：新的一行应已入库，取一次历史（1H 及以下最多每 20 秒一次，更长档位每分钟一次）
+  const minGap = currentHours.value <= 1 ? 20000 : 60000
+  if (Date.now() - lastRealtimeRowTime() > Math.max(65000, historyRowSpacing) && Date.now() - lastRealtimeFetchAt > minGap) refreshRealtimeRows()
   scheduleRealtimeRender()
 }
 
 const loadAllHistory = async (hours) => {
   try {
-    // 定制：10 分钟视图取 30 分钟历史（接口只接受固定档位），只保留窗口内及窗口前一行，
-    // 否则第一条历史常落在窗口起点之后，左侧留白。
-    const realtimeRange = Math.abs(Number(hours) - REALTIME_HISTORY_HOURS) < 0.001
-    const fetchedData = await fetchAllHistory(serverId, realtimeRange ? 0.5 : hours, apiIndex.value)
-    const allData = realtimeRange
-      ? trimToWindow(sortRowsByTime(fetchedData).map(row => ({ ...row, x: rowTime(row) })), Date.now() - hours * 60 * 60 * 1000)
-      : fetchedData
-    if (realtimeRange) {
-      realtimeRows = sortRowsByTime(fetchedData)
-      lastRealtimeFetchAt = Date.now()
-    }
+    // 定制：接口只接受固定档位；10M/30M 取更高一档，再只保留窗口内及窗口前一行，避免左侧留白
+    const fetchedData = await fetchAllHistory(serverId, historyFetchHours(Number(hours)), apiIndex.value)
+    const allData = trimToWindow(sortRowsByTime(fetchedData).map(row => ({ ...row, x: rowTime(row) })), Date.now() - hours * 60 * 60 * 1000)
+    realtimeRows = sortRowsByTime(fetchedData)
+    lastRealtimeFetchAt = Date.now()
+    historyRowSpacing = medianSpacing(realtimeRows.map(rowTime)) || 60000
     lastReportChartUpdateTime = 0
     lossHistoryFields.value = Object.fromEntries(PING_FIELD_DEFS.map(item => [
       item.lossField,
@@ -1529,7 +1532,7 @@ const loadAllHistory = async (hours) => {
     }
 
     updateAllChartTimeUnits(hours)
-    if (realtimeRange) renderRealtimeCharts()
+    renderRealtimeCharts()
     historyLoaded.value = true
 
     await nextTick()
@@ -1862,7 +1865,7 @@ const fetchCurrentStatus = async (incomingData, options = {}) => {
     }
     syncProbeChartVisibility()
 
-    if (data.last_updated && chartsReady.value && isRealtimeHistoryRange()) {
+    if (data.last_updated && chartsReady.value) {
       const dataTimestamp = new Date(data.last_updated).getTime()
       pushLiveSample(data, dataTimestamp)
     }
@@ -2001,7 +2004,7 @@ const init = async () => {
 
   document.addEventListener('visibilitychange', handleVisibility)
   realtimeRefreshTimer = setInterval(() => {
-    if (Date.now() - lastRealtimeFetchAt >= 55000) refreshRealtimeRows()
+    if (Date.now() - lastRealtimeFetchAt >= Math.max(55000, historyRowSpacing)) refreshRealtimeRows()
   }, 60000)
 }
 
