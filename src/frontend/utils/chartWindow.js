@@ -12,19 +12,6 @@ export function trimToWindow(data, startTime) {
   return data.slice(Math.max(0, (first < 0 ? data.length : first) - 1))
 }
 
-// Merge cached high-resolution points into a dataset: inside the span the cache covers,
-// the cache wins; outside it the current (history/live) points stay.
-export function mergeCachedPoints(current, cached) {
-  if (!Array.isArray(cached) || cached.length === 0) return Array.isArray(current) ? current : []
-  const from = ts(cached[0])
-  const to = ts(cached[cached.length - 1])
-  const outside = (current || []).filter(point => {
-    const t = ts(point)
-    return t < from || t > to
-  })
-  return [...outside, ...cached].sort((a, b) => ts(a) - ts(b))
-}
-
 // Tick spacing that lands on whole minutes/hours: the smallest step from the ladder that
 // keeps the tick count within `maxTicks` (otherwise Chart.js picks e.g. 100 s itself).
 // Whole-hour time zones such as UTC+8 see local whole hours.
@@ -42,4 +29,43 @@ export function alignedTicks(min, max, step) {
   const ticks = []
   for (let value = Math.ceil(min / step) * step; value <= max; value += step) ticks.push({ value })
   return ticks
+}
+
+// The in-progress minute of the realtime resource charts, aggregated exactly as the Worker
+// aggregates samples into each stored history row (HISTORY_METRIC_AGGREGATION_POLICY):
+// averages for CPU/memory/probes, maxima for rates, counts and disk IO; anything else is
+// the latest value. Once the row is stored, the next history fetch replaces this point.
+const AVG_FIELDS = ['cpu', 'ram_used', 'swap_used', 'ping_ct', 'ping_cu', 'ping_cm', 'ping_bd', 'loss_ct', 'loss_cu', 'loss_cm', 'loss_bd']
+const MAX_FIELDS = ['net_in_speed', 'net_out_speed', 'processes', 'tcp_conn', 'udp_conn']
+const MAX_DISK_FIELDS = ['read_bps', 'write_bps', 'read_iops', 'write_iops', 'await_ms', 'util']
+const finite = value => {
+  if (value === null || value === undefined || value === '' || value === false) return null
+  const number = Number(value)
+  return Number.isFinite(number) ? number : null
+}
+
+export function aggregateLiveRow(samples) {
+  if (!Array.isArray(samples) || samples.length === 0) return null
+  const ordered = [...samples].sort((a, b) => a.ts - b.ts)
+  const row = Object.assign({}, ...ordered.map(sample => sample.data))
+  const pick = (get, reduce) => {
+    const values = ordered.map(sample => finite(get(sample.data))).filter(value => value !== null)
+    return values.length ? reduce(values) : undefined
+  }
+  for (const field of AVG_FIELDS) {
+    const value = pick(data => data?.[field], values => values.reduce((sum, v) => sum + v, 0) / values.length)
+    if (value !== undefined) row[field] = value
+  }
+  for (const field of MAX_FIELDS) {
+    const value = pick(data => data?.[field], values => Math.max(...values))
+    if (value !== undefined) row[field] = value
+  }
+  const disk = {}
+  for (const field of MAX_DISK_FIELDS) {
+    const value = pick(data => data?.disk && typeof data.disk === 'object' ? data.disk[field] : null, values => Math.max(...values))
+    if (value !== undefined) disk[field] = value
+  }
+  if (Object.keys(disk).length) row.disk = { ...(row.disk && typeof row.disk === 'object' ? row.disk : {}), ...disk }
+  row.timestamp = ordered[ordered.length - 1].ts
+  return row
 }
