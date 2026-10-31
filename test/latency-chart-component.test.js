@@ -110,13 +110,13 @@ test('mounted charts have independent routes, ranges and history controls while 
     button('30M',1).props.onClick();await settle();
     slider(1).props.onInput({target:{value:'120'}});await settle();
     const lossReview=bounds(1);
-    selectedHours.value=6;await settle(); // an external page range change must also leave loss alone
+    button('6H',0).props.onClick();await settle(); // the latency chart's own range leaves loss alone
     assert.equal(charts[0].options.scales.x.max-charts[0].options.scales.x.min,6*3600000);
     assert.equal(charts[1].options.scales.x.min,lossReview.min);
     assert.equal(charts[1].options.scales.x.max,lossReview.max);
     assert.equal(slider(1).props.value,120);
     assert.equal(button('30M',1).props['aria-pressed'],true);
-    selectedHours.value=24;await settle();
+    button('24H',0).props.onClick();await settle();
     assert.equal(slider(0),undefined); // each chart hides only its own slider at 24H
     assert.ok(slider(1));
     button('24H',1).props.onClick();await settle();
@@ -163,6 +163,7 @@ test('mounted charts have independent routes, ranges and history controls while 
     assert.ok(slider(0));
     button('24H').props.onClick();await settle();
     assert.equal(all().filter(node=>node.type==='input'&&node.props.type==='range').length,0);
+    assert.equal(rangeEvents.length,0); // dense chart ranges never change the page's (resource charts') range
     document.hidden=true;
     await intervals[0].callback();
     assert.equal(queries.length,11);

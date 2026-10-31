@@ -326,7 +326,7 @@
         </div>
       </div>
 
-      <LatencyDetailCharts :key="serverId + apiIndex" :server-id="serverId" :api-index="apiIndex" :labels="denseLatencyLabels" :selected-hours="denseLatencyHours" :probe-mode="server.ping_mode || 'tcp'" :live-samples="server.latency_live" @update:selected-hours="setTimeRange" @active="denseLatencyActive = $event" />
+      <LatencyDetailCharts :key="serverId + apiIndex" :server-id="serverId" :api-index="apiIndex" :labels="denseLatencyLabels" :probe-mode="server.ping_mode || 'tcp'" :live-samples="server.latency_live" @active="denseLatencyActive = $event" />
       <div class="chart-card" :class="{ 'full-width': isChartExpanded('ping') }" v-show="hasPingData && !denseLatencyActive">
         <div class="chart-card-header">
           <span class="chart-title">
@@ -439,7 +439,6 @@ if (indexParam !== undefined && indexParam !== null && !isNaN(parseInt(indexPara
 }
 
 const denseLatencyActive = ref(false)
-const denseLatencyHours = ref(24)
 const denseLatencyLabels = computed(() => ['ct','cu','cm','bd','node_1','node_2','node_3','node_4'].map(pingLabel))
 const server = ref({})
 const REALTIME_HISTORY_HOURS = 0.167
@@ -1886,7 +1885,6 @@ const setTimeRange = (hours) => {
   }
   const selectedHours = Math.abs(hours - REALTIME_HISTORY_HOURS) < 0.001 ? REALTIME_HISTORY_HOURS : hours
   currentHours.value = selectedHours
-  denseLatencyHours.value = Math.min(selectedHours, 24)
   loadAllHistory(selectedHours)
 }
 

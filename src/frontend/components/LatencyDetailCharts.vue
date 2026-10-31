@@ -58,8 +58,9 @@ import { currentLang } from '../utils/i18n'
 import { latencyChartSeries, latencyAxisCap, RETRANSMIT_MS } from '../utils/latencyDetail.js'
 import { createLatencyHistoryLoader } from '../utils/latencyHistory.js'
 import { timeTickStep, alignedTicks } from '../utils/chartWindow.js'
-const props = defineProps({ serverId: String, apiIndex: { type: Number, default: 0 }, labels: { type: Array, default: () => [] }, selectedHours: { type: Number, default: 24 }, probeMode: { type: String, default: 'tcp' }, liveSamples: { type: Array, default: null } })
-const emit = defineEmits(['active', 'update:selectedHours'])
+const props = defineProps({ serverId: String, apiIndex: { type: Number, default: 0 }, labels: { type: Array, default: () => [] }, probeMode: { type: String, default: 'tcp' }, liveSamples: { type: Array, default: null } })
+// The page's range buttons drive the resource charts only; each dense chart keeps its own range.
+const emit = defineEmits(['active'])
 const timeOptions = [
   { hours: 1/6, label: '10M' },
   { hours: 0.5, label: '30M' },
@@ -139,7 +140,7 @@ function setOffset(value) {
   if (offset === 0) historyAnchor.value = null
   offsetMinutes.value = offset
 }
-function setRange(n) { hours.value=n; setOffset(0); emit('update:selectedHours',n) }
+function setRange(n) { hours.value=n; setOffset(0) }
 function setLossOffset(value) {
   const offset = Math.max(0, Math.min(1440 - lossHours.value * 60, Number(value) || 0))
   if (offset > 0 && lossHistoryAnchor.value === null) lossHistoryAnchor.value = clock.value
@@ -147,11 +148,6 @@ function setLossOffset(value) {
   lossOffsetMinutes.value = offset
 }
 function setLossRange(n) { lossHours.value=n; setLossOffset(0) }
-watch(() => props.selectedHours, value => {
-  // The existing page uses 0.167 for its 10-minute realtime range.
-  const option=timeOptions.find(option => Math.abs(option.hours-value)<0.001)
-  if (option) { hours.value=option.hours; setOffset(0) }
-}, { immediate:true })
 function destroyCharts() { ping?.destroy(); loss?.destroy(); ping=undefined; loss=undefined }
 // Mark unread history on the actual plot area, rather than displaying it as a measurement gap.
 const pendingHistory = {
