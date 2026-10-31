@@ -48,3 +48,13 @@ test('aggregateLiveRow aggregates the in-progress minute like stored history row
   assert.equal(row.timestamp, 5000);
   assert.equal(aggregateLiveRow([]), null);
 });
+
+test('windowStart fills a sub-bucket gap at the left edge but keeps real gaps', async () => {
+  const { windowStart, medianSpacing } = await import('../src/frontend/utils/chartWindow.js');
+  assert.equal(medianSpacing([0, 60, 120, 200, 260]), 60);
+  assert.equal(medianSpacing([5]), 0);
+  assert.equal(windowStart(1000, 1050, 60), 1050, 'first row within a bucket: no blank strip');
+  assert.equal(windowStart(1000, 1200, 60), 1000, 'node was offline: gap stays visible');
+  assert.equal(windowStart(1000, 900, 60), 1000, 'row before the window: nominal start');
+  assert.equal(windowStart(1000, NaN, 60), 1000);
+});

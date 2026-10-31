@@ -69,3 +69,19 @@ export function aggregateLiveRow(samples) {
   row.timestamp = ordered[ordered.length - 1].ts
   return row
 }
+
+// Median spacing of stored rows (ms): the history bucket size for this range.
+export function medianSpacing(times) {
+  const gaps = []
+  for (let i = 1; i < times.length; i++) if (times[i] > times[i - 1]) gaps.push(times[i] - times[i - 1])
+  if (gaps.length === 0) return 0
+  gaps.sort((a, b) => a - b)
+  return gaps[Math.floor(gaps.length / 2)]
+}
+
+// Left edge of the window: when the first stored point lies less than ~one bucket after the
+// nominal start, start the axis there so the plot is full; a longer gap is real (no data).
+export function windowStart(start, firstTs, spacing) {
+  if (!Number.isFinite(firstTs) || !(spacing > 0) || firstTs <= start) return start
+  return firstTs - start <= 1.5 * spacing ? firstTs : start
+}

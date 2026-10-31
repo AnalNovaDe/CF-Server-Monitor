@@ -63,10 +63,10 @@ test('mounted charts have independent routes, ranges and history controls while 
   const button=(label,section)=> (section===undefined?all():sectionNodes(section)).find(node=>node.type==='button'&&text(node)===label);
   const slider=section=>sectionNodes(section).find(node=>node.type==='input'&&node.props.type==='range');
   const bounds=index=>({...charts[index].options.scales.x});
-  const selectedHours=ref(24),rangeEvents=[];
+  const rangeHours=ref(24);
   try {
     const Component=(await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`)).default;
-    app=renderer.createApp({render:()=>h(Component,{serverId:'ui-node',labels:['测试线路','备用线路'],selectedHours:selectedHours.value,'onUpdate:selectedHours':value=>{rangeEvents.push(value);selectedHours.value=value;}})});
+    app=renderer.createApp({render:()=>h(Component,{serverId:'ui-node',labels:['测试线路','备用线路'],rangeHours:rangeHours.value})});
     app.mount(root);
     for(let i=0;i<60&&!text(root).includes('历史尚未加载完整');i++)await settle();
     assert.match(text(root),/历史尚未加载完整/);
@@ -96,39 +96,17 @@ test('mounted charts have independent routes, ranges and history controls while 
     assert.equal(button('备用线路',1).props.style.opacity,.4);
     assert.equal(button('备用线路',0).props.style.opacity,1);
     assert.equal(queries.length,9); // chart visibility is local and never re-fetches history
-    const initialLatency=bounds(0);
-    for(const [label,minutes] of [['10M',10],['30M',30],['1H',60],['6H',360],['12H',720],['24H',1440]]) {
-      button(label,1).props.onClick();await settle();
-      assert.equal(charts[1].options.scales.x.max-charts[1].options.scales.x.min,minutes*60000);
-      assert.equal(charts[0].options.scales.x.min,initialLatency.min);
-      assert.equal(charts[0].options.scales.x.max,initialLatency.max);
-      assert.equal(button(label,1).props['aria-pressed'],true);
-      if(minutes<1440)assert.equal(slider(1).props.max,1440-minutes);
-      else assert.equal(slider(1),undefined);
+    // Both dense charts follow the page's single range selector; they have no range buttons of their own.
+    assert.equal(all().filter(node=>node.type==='button'&&/^(10M|30M|1H|6H|12H|24H)$/.test(text(node))).length,0);
+    for(const [hours,minutes] of [[0.167,10],[0.5,30],[1,60],[6,360],[12,720],[24,1440]]) {
+      rangeHours.value=hours;await settle();
+      for(const index of [0,1]) assert.equal(charts[index].options.scales.x.max-charts[index].options.scales.x.min,minutes*60000);
+      if(minutes<1440){assert.equal(slider(0).props.max,1440-minutes);assert.equal(slider(1).props.max,1440-minutes);}
+      else{assert.equal(slider(0),undefined);assert.equal(slider(1),undefined);}
     }
-    assert.equal(rangeEvents.length,0); // loss controls never change the page's latency range
-    button('30M',1).props.onClick();await settle();
-    slider(1).props.onInput({target:{value:'120'}});await settle();
-    const lossReview=bounds(1);
-    button('6H',0).props.onClick();await settle(); // the latency chart's own range leaves loss alone
-    assert.equal(charts[0].options.scales.x.max-charts[0].options.scales.x.min,6*3600000);
-    assert.equal(charts[1].options.scales.x.min,lossReview.min);
-    assert.equal(charts[1].options.scales.x.max,lossReview.max);
-    assert.equal(slider(1).props.value,120);
-    assert.equal(button('30M',1).props['aria-pressed'],true);
-    button('24H',0).props.onClick();await settle();
-    assert.equal(slider(0),undefined); // each chart hides only its own slider at 24H
-    assert.ok(slider(1));
-    button('24H',1).props.onClick();await settle();
-    for(const [label,minutes] of [['10M',10],['30M',30],['1H',60],['6H',360],['12H',720]]) {
-      button(label).props.onClick();await settle();
-      assert.equal(charts[0].options.scales.x.max-charts[0].options.scales.x.min,minutes*60000);
-      assert.equal(slider(0).props.max,1440-minutes);
-      assert.equal(charts[1].options.scales.x.max-charts[1].options.scales.x.min,86400000);
-    }
-    button('10M').props.onClick();await settle();
-    button('30M',1).props.onClick();await settle();
-    assert.equal(slider(0).props.max,1430);
+    rangeHours.value=0.5;await settle();
+    assert.equal(slider(0).props.max,1410);
+    // History sliders stay independent per chart.
     slider(0).props.onInput({target:{value:'60'}});await settle();
     assert.match(text(root),/正在回看固定历史时段/);
     const reviewEnd=charts[0].options.scales.x.max;
@@ -136,7 +114,7 @@ test('mounted charts have independent routes, ranges and history controls while 
     clock+=60000;
     await intervals[0].callback();await settle();
     assert.equal(queries.length,10);
-    assert.deepEqual(visibility(),[[false,true],[true,false]]); // ranges, sliders and automatic refresh retain each chart's choices
+    assert.deepEqual(visibility(),[[false,true],[true,false]]); // sliders, visibility and automatic refresh retain each chart's choices
     assert.equal(charts[0].options.scales.x.max,reviewEnd);
     assert.equal(charts[1].options.scales.x.max,clock); // loss follows while latency reviews history
     button('回到最新').props.onClick();await settle();
@@ -157,13 +135,8 @@ test('mounted charts have independent routes, ranges and history controls while 
     assert.equal(charts[1].options.scales.x.max,fixedLossEnd);
     button('回到最新',1).props.onClick();await settle();
     assert.equal(charts[1].options.scales.x.max,clock);
-    assert.equal(charts[0].options.scales.x.max,clock);
-    button('24H',1).props.onClick();await settle();
-    assert.equal(slider(1),undefined);
-    assert.ok(slider(0));
-    button('24H').props.onClick();await settle();
+    rangeHours.value=24;await settle(); // a page range change resets both charts to follow the latest
     assert.equal(all().filter(node=>node.type==='input'&&node.props.type==='range').length,0);
-    assert.equal(rangeEvents.length,0); // dense chart ranges never change the page's (resource charts') range
     document.hidden=true;
     await intervals[0].callback();
     assert.equal(queries.length,11);
