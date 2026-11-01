@@ -11,9 +11,7 @@
     <template v-if="enabled">
       <div class="route-buttons" role="group" :aria-label="en ? 'Latency route visibility' : '延迟线路显示'">
         <button v-for="i in available" :key="i" class="btn" :style="{ color: colors[i], opacity: pingHidden.includes(i) ? .4 : 1 }" :aria-pressed="!pingHidden.includes(i)" @click="toggleRoute(i)">{{ labels[i] || `Node ${i+1}` }}</button>
-        <button class="btn axis-toggle" :class="{ active: fullAxis }" :aria-pressed="fullAxis" @click="fullAxis = !fullAxis">{{ fullAxis ? (en ? 'Full axis' : '完整纵轴') : (en ? 'Adaptive axis' : '自适应纵轴') }}</button>
       </div>
-      <p v-if="pingCap" class="detail-note">{{ en ? `Axis capped at ${pingCap} ms; ▲ marks higher values (hover for the real value).` : `纵轴封顶 ${pingCap} ms，▲ 为超出值，悬停看实际值。` }}</p>
       <p v-if="!samples.length && history.complete" class="detail-note">{{ en ? 'No measurements in the loaded 24h. Check Agent uploads; earlier detailed samples cannot be reconstructed.' : '最近 24h 已读取完毕，未找到测量记录；请检查 Agent 上报。启用前的高精度历史无法补回。' }}</p>
       <div class="dense-chart"><canvas ref="pingCanvas" :aria-label="en ? 'Raw latency chart' : '逐次延迟图'" role="img"></canvas></div>
       <div v-if="hours < 24" class="time-slider">
@@ -49,7 +47,7 @@ import { ref, shallowRef, computed, watch, nextTick, onMounted, onUnmounted } fr
 import Chart from 'chart.js/auto'
 import { http } from '../utils/http'
 import { currentLang } from '../utils/i18n'
-import { latencyChartSeries, latencyAxisCap, RETRANSMIT_MS } from '../utils/latencyDetail.js'
+import { latencyChartSeries, RETRANSMIT_MS } from '../utils/latencyDetail.js'
 import { createLatencyHistoryLoader } from '../utils/latencyHistory.js'
 import { timeTickStep, alignedTicks } from '../utils/chartWindow.js'
 const props = defineProps({ serverId: String, apiIndex: { type: Number, default: 0 }, labels: { type: Array, default: () => [] }, rangeHours: { type: Number, default: 24 }, probeMode: { type: String, default: 'tcp' }, liveSamples: { type: Array, default: null } })
@@ -73,7 +71,6 @@ const pingHidden = ref([]), lossHidden = ref([])
 const hours = ref(24), offsetMinutes = ref(0), historyAnchor = ref(null), clock = ref(Date.now()), pingCanvas = ref(null), lossCanvas = ref(null)
 const lossHours = ref(24), lossOffsetMinutes = ref(0), lossHistoryAnchor = ref(null)
 const lastRefresh = ref(null)
-const fullAxis = ref(false), pingCap = ref(null)
 const colors = ['#00a58b','#e49b40','#4da6ff','#b392f0','#ff7b72','#79c0ff','#60ba66','#fa8a44']
 let ping, loss, timer, disposed = false, observer, drawFrame
 const history = shallowRef({})
@@ -183,8 +180,8 @@ function draw() {
   const lossEnd = lossViewEnd.value, lossStart = lossViewStart.value
   let maxLoss = 0
   const options = (isLoss) => ({ responsive:true, maintainAspectRatio:false, animation:false, parsing:false,
-    interaction:{ mode:'nearest',intersect:false }, plugins:{ legend:{display:false}, tooltip:{ filter: item => !item.dataset.isMarker, callbacks:{ title: items=>items.length ? new Date(items[0].parsed.x).toLocaleString() : '', label:item=> {
-      const value = item.raw.raw ?? item.parsed.y
+    interaction:{ mode:'nearest',intersect:false }, plugins:{ legend:{display:false}, tooltip:{ callbacks:{ title: items=>items.length ? new Date(items[0].parsed.x).toLocaleString() : '', label:item=> {
+      const value = item.parsed.y
       let label = `${item.dataset.label}: ${Number(value).toFixed(isLoss?1:0)}${isLoss?'%':' ms'}`
       if (!isLoss && protocol.value === 'TCP' && value >= RETRANSMIT_MS) label += en.value ? ' (likely SYN retransmit)' : '（疑似 SYN 重传）'
       if (isLoss && item.raw.attempts) {
@@ -194,20 +191,12 @@ function draw() {
       }
       return label
     } } } },
-    scales:{ x:{ type:'linear',min:isLoss?lossStart:start,max:isLoss?lossEnd:end,grid:{color:grid},afterBuildTicks:scale=>{scale.ticks=alignedTicks(scale.min,scale.max,timeTickStep(isLoss?lossHours.value:hours.value,8))},ticks:{color:text,maxTicksLimit:8,minRotation:0,maxRotation:0,callback:v=>new Date(v).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})} },y:{min:isLoss?0:undefined,max:isLoss?Math.min(100,Math.max(10,Math.ceil(maxLoss*1.1/5)*5)):(cap ?? undefined),grid:{color:grid},ticks:{color:text},title:{display:true,text:isLoss?'%':'ms',color:text}} }
+    scales:{ x:{ type:'linear',min:isLoss?lossStart:start,max:isLoss?lossEnd:end,grid:{color:grid},afterBuildTicks:scale=>{scale.ticks=alignedTicks(scale.min,scale.max,timeTickStep(isLoss?lossHours.value:hours.value,8))},ticks:{color:text,maxTicksLimit:8,minRotation:0,maxRotation:0,callback:v=>new Date(v).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})} },y:{min:isLoss?0:undefined,max:isLoss?Math.min(100,Math.max(10,Math.ceil(maxLoss*1.1/5)*5)):undefined,grid:{color:grid},ticks:{color:text},title:{display:true,text:isLoss?'%':'ms',color:text}} }
   })
-  const p=[],l=[],markers=[]
-  // Adaptive axis from the visible routes in the visible range.
-  const visibleValues = []
+  const p=[],l=[]
+  // Full latency axis: every measurement at its real height.
   for (const i of available.value) {
-    if (pingHidden.value.includes(i)) continue
-    for (const point of chartSeries.value.get(i)?.ping || []) if (point.x >= start && point.x <= end && point.y !== null) visibleValues.push(point.y)
-  }
-  const cap = fullAxis.value ? null : latencyAxisCap(visibleValues)
-  pingCap.value = cap
-  for (const i of available.value) {
-    const rawPing=chartSeries.value.get(i)?.ping || []
-    const pingPoints=cap === null ? rawPing : rawPing.map(point => point.y !== null && point.y > cap ? { x: point.x, y: cap, raw: point.y } : point)
+    const pingPoints=chartSeries.value.get(i)?.ping || []
     const rawLoss=lossChartSeries.value.get(i)?.loss || []
     // TCP: loss = failed + SYN retransmits (>=1s connects from pre-latency.4 agents).
     const lossPoints=protocol.value === 'TCP'
@@ -216,10 +205,6 @@ function draw() {
     const common={label:props.labels[i]||`Node ${i+1}`,borderColor:colors[i],backgroundColor:colors[i],borderWidth:1,pointRadius:0,tension:0,spanGaps:false}
     // A success between two failures has no neighbour to draw a line to: show it as a dot.
     p.push({...common,data:pingPoints,hidden:pingHidden.value.includes(i),pointRadius:isolatedRadius,pointHoverRadius:3})
-    if (cap !== null) {
-      const over = pingPoints.filter(point => point.raw !== undefined)
-      if (over.length) markers.push({...common,type:'scatter',isMarker:true,data:over,pointStyle:'triangle',pointRadius:3.5,pointHoverRadius:5,borderWidth:0,showLine:false,hidden:pingHidden.value.includes(i)})
-    }
     l.push({...common,borderWidth:1.5,data:lossPoints,hidden:lossHidden.value.includes(i)})
     if (!lossHidden.value.includes(i)) {
       for (const point of lossPoints) {
@@ -227,9 +212,8 @@ function draw() {
       }
     }
   }
-  const pingSets=[...p,...markers]
-  if (!ping) ping=new Chart(pingCanvas.value,{type:'line',data:{datasets:pingSets},options:options(false),plugins:[pendingHistory]})
-  else {ping.data.datasets=pingSets;ping.options=options(false);ping.update('none')}
+  if (!ping) ping=new Chart(pingCanvas.value,{type:'line',data:{datasets:p},options:options(false),plugins:[pendingHistory]})
+  else {ping.data.datasets=p;ping.options=options(false);ping.update('none')}
   if (!loss) loss=new Chart(lossCanvas.value,{type:'line',data:{datasets:l},options:options(true),plugins:[pendingHistory]})
   else {loss.data.datasets=l;loss.options=options(true);loss.update('none')}
 }
@@ -254,12 +238,12 @@ watch(() => props.liveSamples, live => {
   scheduleDraw()
 })
 watch(enabled, active => { emit('active', active); if (!active) destroyCharts() })
-watch([hours,offsetMinutes,historyAnchor,lossHours,lossOffsetMinutes,lossHistoryAnchor,pingHidden,lossHidden,fullAxis,()=>props.labels,protocol,currentLang], scheduleDraw, { flush:'post' })
+watch([hours,offsetMinutes,historyAnchor,lossHours,lossOffsetMinutes,lossHistoryAnchor,pingHidden,lossHidden,()=>props.labels,protocol,currentLang], scheduleDraw, { flush:'post' })
 onMounted(()=>{load();timer=setInterval(load,60000);document.addEventListener('visibilitychange',onVisibility);observer=new MutationObserver(scheduleDraw);observer.observe(document.body,{attributes:true,attributeFilter:['class']})})
 onUnmounted(()=>{disposed=true;loader.dispose();clearInterval(timer);cancelAnimationFrame(drawFrame);document.removeEventListener('visibilitychange',onVisibility);observer?.disconnect();destroyCharts()})
 </script>
 
 <style scoped>
-.latency-detail{grid-column:1 / -1;min-width:0}.dense-chart{position:relative;height:350px;padding:12px 18px}.dense-chart.loss{height:230px}.detail-note{font-size:12px;line-height:1.7;padding:4px 18px;opacity:.85;overflow-wrap:anywhere}.range-buttons,.route-buttons{display:flex;gap:8px;flex-wrap:wrap}.route-buttons{padding:0 18px}.btn.active{background:var(--accent-color,#158064);color:white}.axis-toggle{margin-left:auto}.time-slider{display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:12px 18px;font-size:12px}.time-slider label{display:flex;align-items:center;gap:12px;flex:1}.time-slider input{flex:1;min-width:80px}@media(max-width:600px){.dense-chart{height:280px;padding:8px}.chart-card-header{flex-wrap:wrap;gap:8px}.detail-note{padding:4px 12px}}
+.latency-detail{grid-column:1 / -1;min-width:0}.dense-chart{position:relative;height:350px;padding:12px 18px}.dense-chart.loss{height:230px}.detail-note{font-size:12px;line-height:1.7;padding:4px 18px;opacity:.85;overflow-wrap:anywhere}.range-buttons,.route-buttons{display:flex;gap:8px;flex-wrap:wrap}.route-buttons{padding:0 18px}.btn.active{background:var(--accent-color,#158064);color:white}.time-slider{display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:12px 18px;font-size:12px}.time-slider label{display:flex;align-items:center;gap:12px;flex:1}.time-slider input{flex:1;min-width:80px}@media(max-width:600px){.dense-chart{height:280px;padding:8px}.chart-card-header{flex-wrap:wrap;gap:8px}.detail-note{padding:4px 12px}}
 .history-status{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.history-status progress{width:140px;height:8px;accent-color:var(--accent-color,#158064)}
 </style>

@@ -65,16 +65,3 @@ export function latencyChartSeries(samples, start, end) {
     return [index, { ping: clip(series.ping), loss: clip(series.loss) }];
   }));
 }
-
-// Adaptive latency axis: scale to the normal baseline so it stays readable; values above the
-// cap are drawn as markers at the top edge, never discarded. The baseline excludes >=1s
-// samples (retransmits), which can be several percent of all samples at peak hours.
-export function latencyAxisCap(values) {
-  const finite = values.filter(Number.isFinite);
-  const base = finite.filter(v => v < RETRANSMIT_MS);
-  const source = Float64Array.from(base.length >= 20 ? base : finite).sort();
-  if (source.length < 20) return null;
-  const p95 = source[Math.floor((source.length - 1) * 0.95)];
-  const cap = Math.max(100, Math.ceil(p95 * 1.5 / 50) * 50);
-  return Math.max(...finite) > cap ? cap : null;
-}

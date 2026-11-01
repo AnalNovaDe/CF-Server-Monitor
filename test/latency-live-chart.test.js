@@ -60,8 +60,7 @@ test('live samples draw within seconds, merge with history and the axis keeps sp
   const settle = async () => { await nextTick(); await new Promise(resolve => setTimeout(resolve, 5)); await nextTick(); };
   const button = label => all().find(node => node.type === 'button' && text(node) === label);
   const live = ref(null);
-  const pingLine = () => charts[0].data.datasets.find(d => !d.isMarker && d.label === '测试线路');
-  const markers = () => charts[0].data.datasets.filter(d => d.isMarker);
+  const pingLine = () => charts[0].data.datasets.find(d => d.label === '测试线路');
   try {
     const Component = (await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`)).default;
     app = renderer.createApp({ render: () => h(Component, { serverId: 'live-node', labels: ['测试线路'], selectedHours: 24, probeMode: 'tcp', liveSamples: live.value }) });
@@ -69,22 +68,14 @@ test('live samples draw within seconds, merge with history and the axis keeps sp
     for (let i = 0; i < 60 && !text(root).includes('每分钟刷新 · 最新'); i++) await settle();
     await settle();
 
-    // Adaptive axis: capped near the baseline, spike kept as a marker with its real value.
-    assert.equal(charts[0].options.scales.y.max, 100);
-    assert.match(text(root), /纵轴封顶 100 ms/);
-    assert.doesNotMatch(text(root), /计入 SYN 重传/, 'no toggle: retransmits always count');
-    assert.equal(markers().length, 1);
-    assert.deepEqual(markers()[0].data.map(p => p.raw), [1100]);
-    assert.equal(pingLine().data.find(p => p.raw === 1100).y, 100);
-    const label = charts[0].options.plugins.tooltip.callbacks.label({ dataset: pingLine(), raw: pingLine().data.find(p => p.raw === 1100), parsed: { y: 100 } });
-    assert.match(label, /1100 ms（疑似 SYN 重传）/);
-    assert.equal(charts[0].options.plugins.tooltip.filter({ dataset: markers()[0] }), false, 'markers do not duplicate tooltips');
-    button('自适应纵轴').props.onClick();
-    await settle();
+    // Full axis only: every measurement at its real height, no cap, markers or axis toggle.
     assert.equal(charts[0].options.scales.y.max, undefined);
-    assert.equal(markers().length, 0);
-    button('完整纵轴').props.onClick();
-    await settle();
+    assert.doesNotMatch(text(root), /纵轴|计入 SYN 重传/, 'no axis toggle, no retransmit toggle');
+    assert.equal(charts[0].data.datasets.length, 1, 'one line per route, no marker datasets');
+    const spike = pingLine().data.find(p => p.y === 1100);
+    assert.ok(spike, 'the 1100 ms sample is drawn at its real value');
+    const label = charts[0].options.plugins.tooltip.callbacks.label({ dataset: pingLine(), raw: spike, parsed: { y: 1100 } });
+    assert.match(label, /1100 ms（疑似 SYN 重传）/);
 
     // TCP loss always counts >=1s connects (SYN retransmits from older agents) with failures.
     const atSpike = () => charts[1].data.datasets[0].data.find(p => p.x === historySamples[31].t);
