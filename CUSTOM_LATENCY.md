@@ -2,6 +2,7 @@
 
 用户 fork 基线：AnalNovaDe/CF-Server-Monitor @ 463bb1f9e11218b0e0a87a3672825d2a4ee30449。
 配套 Agent 基线：huilang-me/cfsm-agent @ 3e7353c82a25d3845ec5cffa45f053dbc3301559。
+已合并上游：huilang-me/CF-Server-Monitor v2.8.7 正式版（2026-11-12）。
 约束：6 台服务器，每台最多 8 个目标，必须使用 Cloudflare 免费方案。不得为本功能开通付费。
 
 ## 行为
