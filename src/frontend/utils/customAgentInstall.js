@@ -1,5 +1,5 @@
-export const CUSTOM_INSTALLER_RELEASE = 'https://github.com/AnalNovaDe/CF-Server-Monitor/releases/download/agent-installer-1.0.4'
-export const CUSTOM_AGENT_VERSION = '1.0.19-latency.5'
+export const CUSTOM_INSTALLER_RELEASE = 'https://github.com/AnalNovaDe/CF-Server-Monitor/releases/download/agent-installer-1.0.5'
+export const CUSTOM_AGENT_VERSION = '1.1.4-latency.1'
 export const CUSTOM_INSTALLER_SHA256 = 'fc652d7eacac7553ccbce6d07f1fdc5479569c10e28030b898ae3ce5ee4a2190'
 const quote = value => `'${String(value).replaceAll("'", `'"'"'`)}'`
 

@@ -42,7 +42,7 @@ test('migration 002 keeps stored minutes, seeds legacy slots and enrols new node
     // The install check enrols into the lowest free slot and keeps the installer's exact reply.
     const ready = await check('node-5');
     assert.equal(ready.status, 200);
-    assert.equal(await ready.text(), '{"enabled":true,"version":"1.0.19-latency.5"}');
+    assert.equal(await ready.text(), '{"enabled":true,"version":"1.1.4-latency.1"}');
     assert.equal(await resolveDetailSlot(env, 'node-5'), 2);
     // An already-installed Agent enrols on its first upload too.
     assert.equal((await upload('node-6')).status, 200);

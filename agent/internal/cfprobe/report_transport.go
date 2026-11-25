@@ -46,6 +46,7 @@ type reportTransport struct {
 
 type wsProtocolDelayError struct {
 	reason string
+	code   int
 }
 
 type wsScheduleInactiveError struct {
@@ -69,12 +70,16 @@ type wsHelloFrame struct {
 	Protocol string `json:"protocol"`
 }
 
+// wsServerFrame 是服务端下行帧。RealtimeHint 标记服务端主动下发的实时提示回执，
+// 不是对本次上报的确认；字段名需与服务端协议保持一致，拼写不符时恒为 false，
+// 等于没有该区分（此时所有 ack 都会清零连续失败计数）。
 type wsServerFrame struct {
 	Type                 string `json:"type"`
 	TS                   int64  `json:"ts"`
 	Persisted            *bool  `json:"persisted"`
 	NextD1WriteAfterMs   *int64 `json:"nextD1WriteAfterMs"`
 	NextWSSReportAfterMs *int64 `json:"nextWssReportAfterMs"`
+	RealtimeHint         bool   `json:"realtimeHint"`
 	Error                string `json:"error"`
 	Code                 int    `json:"code"`
 	Text                 string `json:"text"`
@@ -82,6 +87,7 @@ type wsServerFrame struct {
 	Body                 string `json:"body"`
 	ConfigBody           string `json:"config_body"`
 	Config               any    `json:"config"`
+	UA                   string `json:"ua"`
 	ConfigMD5            string `json:"config_md5"`
 	ConfigMD5Camel       string `json:"configMd5"`
 	MD5                  string `json:"md5"`
@@ -266,6 +272,8 @@ func (r *reportTransport) run(ctx context.Context) {
 		if !r.waitProtocolPause(ctx) {
 			return
 		}
+		// 上报熔断不阻断建连：连接本身就是配置下发与握手指令的通道，
+		// 把它一起关掉会让熔断期间无法收到服务端配置，只能等暂停到期。
 		if !r.shouldRun(ctx) {
 			return
 		}
@@ -279,6 +287,7 @@ func (r *reportTransport) run(ctx context.Context) {
 					continue
 				}
 				if isAuthConfigHTTPStatus(handshakeErr.StatusCode) {
+					r.agent.noteReportFailure(handshakeErr.StatusCode)
 					r.delayProtocol(fmt.Sprintf("WSS handshake http=%d", handshakeErr.StatusCode))
 					backoff = wssNetworkMinRetry
 					continue
@@ -310,6 +319,9 @@ func (r *reportTransport) run(ctx context.Context) {
 			return
 		}
 		r.agent.log.info("WSS connected url=%s protocol=%s ts=%d", r.wsURL, hello.Protocol, hello.TS)
+		// 握手与 hello 都通过说明凭证和协议正常，直接解除上报熔断：
+		// 否则暂停期内收不到 ack，计数无从清零，退避会一直停在最高档。
+		r.agent.noteReportSuccess()
 
 		err = r.readLoop(ctx, conn)
 		r.clearConn(conn)
@@ -358,7 +370,7 @@ func (r *reportTransport) dial(ctx context.Context) (*webSocketConn, http.Header
 	}
 	headers := http.Header{}
 	headers.Set("Accept", "*/*")
-	headers.Set("User-Agent", "cfsm")
+	headers.Set("User-Agent", firstNonEmpty(cfg.UA, defaultUserAgent))
 	headers.Set("X-Agent-Config-Schema", configSchemaVersion)
 	headers.Set("X-Agent-Version", r.agent.version)
 	headers.Set("X-Agent-Config-Md5", configMD5)
@@ -428,6 +440,17 @@ func (r *reportTransport) readLoop(ctx context.Context, conn *webSocketConn) err
 				r.setNextReportAfterMs(nextWSS)
 			}
 			r.agent.log.debugf("WSS ack ts=%d persisted=%v nextD1WriteAfterMs=%d nextWssReportAfterMs=%d", frame.TS, persisted, nextD1, nextWSS)
+			// 实时提示帧不是上报回执，不能用来清零连续失败计数。
+			// 注意：这里只按帧类型过滤，携带 config 的 ack 仍会清零计数；另外服务端
+			// 若收到上报却从不回 ack，失败计数不会增长，熔断也就不会触发——该场景由
+			// 读超时和 transport 重连兜底，不在此处处理。
+			if !frame.RealtimeHint {
+				r.agent.noteReportSuccess()
+			}
+			// 自定义 UA 与配置下发相互独立：同一帧里可能只有 ua，没有 config。
+			if frame.UA != "" {
+				r.agent.applyRemoteUserAgent(frame.UA)
+			}
 			if body, headers, ok := wssConfigBodyAndHeaders(frame); ok {
 				r.applyConfigBody(body, headers)
 			}
@@ -439,7 +462,7 @@ func (r *reportTransport) readLoop(ctx context.Context, conn *webSocketConn) err
 				return &wsScheduleInactiveError{reason: scheduleReason}
 			}
 			r.agent.log.info("WSS error ts=%d code=%d error=%s", frame.TS, frame.Code, reason)
-			return &wsProtocolDelayError{reason: fmt.Sprintf("server error code=%d error=%s", frame.Code, reason)}
+			return &wsProtocolDelayError{reason: fmt.Sprintf("server error code=%d error=%s", frame.Code, reason), code: frame.Code}
 		case "config", "remote_config":
 			r.handleConfigFrame(frame)
 		case "hello":
@@ -476,7 +499,7 @@ func (r *reportTransport) applyConfigBody(body []byte, headers http.Header) {
 		return
 	}
 	if err := r.agent.applyWSSRemoteConfig(body, headers); err != nil {
-		r.agent.log.warnf("WSS config rejected: %v", err)
+		r.agent.log.warnfOnce("wss-config:"+err.Error(), "WSS config rejected: %v", err)
 		return
 	}
 	r.agent.log.info("WSS config processed bytes=%d", len(body))
@@ -746,11 +769,15 @@ func (r *reportTransport) handleConnectionError(ctx context.Context, err error, 
 	}
 	var delayErr *wsProtocolDelayError
 	if errors.As(err, &delayErr) {
+		if delayErr.code >= 400 {
+			r.agent.noteReportFailure(delayErr.code)
+		}
 		r.delayProtocol(delayErr.reason)
 		*backoff = wssNetworkMinRetry
 		return true
 	}
 	if errors.As(err, &closeErr) && closeErr.Code == 1008 {
+		r.agent.noteReportFailure(closeErr.Code)
 		reason := fmt.Sprintf("WSS close code=1008 reason=%s", closeErr.Reason)
 		r.agent.log.info("WSS error %s", reason)
 		r.delayProtocol(reason)

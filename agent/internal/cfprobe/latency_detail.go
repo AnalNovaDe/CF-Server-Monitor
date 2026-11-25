@@ -253,6 +253,8 @@ func (a *Agent) latencyUploadWorker(ctx context.Context) {
 			req.Header.Set("Content-Type", "application/json")
 			req.Header.Set("Authorization", "Bearer "+cfg.Secret)
 			req.Header.Set("X-Agent-Version", a.version)
+			// Same User-Agent as the metrics reports, so a site UA rule never blocks this channel alone.
+			req.Header.Set("User-Agent", firstNonEmpty(cfg.UA, defaultUserAgent))
 			// Clone the shared client: never follow a redirect carrying the probe secret.
 			client := *sharedReportHTTPClient(8*time.Second, usePublicDNSResolver(cfg))
 			client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }

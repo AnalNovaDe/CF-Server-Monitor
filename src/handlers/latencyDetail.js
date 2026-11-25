@@ -159,7 +159,7 @@ export async function handleLatencyInstallCheck(request, env) {
   try {
     if (await resolveDetailSlot(env, data.id, { enrol: true }) < 0) return json({ error: 'Latency detail is not enabled for this node (all slots in use)' }, 403);
     await env.DB.prepare('SELECT server_slot FROM latency_detail LIMIT 0').all();
-    return json({ enabled: true, version: '1.0.19-latency.5' });
+    return json({ enabled: true, version: '1.1.4-latency.1' });
   } catch { return json({ error: 'Latency storage unavailable; check migration and D1 usage' }, 503); }
 }
 

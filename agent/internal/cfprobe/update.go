@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -72,7 +73,19 @@ func (a *Agent) autoUpdateWorker(ctx context.Context) {
 }
 
 func (a *Agent) checkAndScheduleAgentUpdate(reason string) {
+	if runtime.GOOS == "darwin" {
+		if ok, ver := darwinUpdateSupported(); !ok {
+			a.log.info("auto update skipped: current builds require macOS 13 Ventura or later reason=%s version=%s macos=%s", reason, a.version, ver)
+			return
+		}
+	}
+
 	cfg := a.configSnapshot()
+	if cfg.LatencyDetail {
+		// Custom latency build: an official release would silently drop the custom features.
+		a.log.info("auto update skipped: custom latency build reason=%s version=%s", reason, a.version)
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	candidate, ok, err := checkLatestUpdate(ctx, a.version, usePublicDNSResolver(cfg))
@@ -88,12 +101,52 @@ func (a *Agent) checkAndScheduleAgentUpdate(reason string) {
 	a.scheduleAgentUpdate(candidate, reason, cfg)
 }
 
+// darwinUpdateSupported reports whether this macOS can run newly built release
+// binaries. Builds made with Go 1.27 record LC_BUILD_VERSION minos=13.0, so
+// dyld refuses to load them on macOS 12 and older. Self-replacing there would
+// leave the LaunchAgent pointing at a binary that cannot start, with no way to
+// recover remotely, so the update is skipped instead. A failed probe is treated
+// as unsupported: refusing an update is recoverable, a bricked probe is not.
+func darwinUpdateSupported() (bool, string) {
+	ver, err := darwinProductVersion()
+	if err != nil {
+		return false, ""
+	}
+	return darwinMajorVersion(ver) >= 13, ver
+}
+
+func darwinProductVersion() (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "sw_vers", "-productVersion").Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// darwinMajorVersion returns the leading numeric component of a macOS version
+// string, or 0 when it cannot be parsed.
+func darwinMajorVersion(ver string) int {
+	if i := strings.IndexByte(ver, '.'); i >= 0 {
+		ver = ver[:i]
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(ver))
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
 func checkLatestUpdate(ctx context.Context, currentVersion string, usePublicDNS bool) (updateCandidate, bool, error) {
 	owner, name, err := splitUpdateRepoSlug(defaultUpdateRepo)
 	if err != nil {
 		return updateCandidate{}, false, err
 	}
 	assetName := expectedUpdateAssetName(runtime.GOOS, nativeArch())
+	if assetName == "" {
+		return updateCandidate{}, false, errors.New("cannot determine a compatible update asset for this build")
+	}
 	releases, err := listGitHubReleases(ctx, owner, name, usePublicDNS)
 	if err != nil {
 		return updateCandidate{}, false, err
@@ -218,6 +271,36 @@ func findReleaseAsset(release githubRelease, assetName string) (githubReleaseAss
 }
 
 func expectedUpdateAssetName(goos, goarch string) string {
+	goarm := ""
+	if goos == "linux" && goarch == "arm" {
+		if info, ok := debug.ReadBuildInfo(); ok {
+			for _, setting := range info.Settings {
+				if setting.Key == "GOARM" {
+					goarm = setting.Value
+					break
+				}
+			}
+		}
+	}
+	return updateAssetNameForARM(goos, goarch, goarm)
+}
+
+func updateAssetNameForARM(goos, goarch, goarm string) string {
+	if goos == "linux" && goarch == "arm" {
+		switch goarm {
+		case "5", "5,softfloat", "5,hardfloat":
+			goarch = "armv5"
+		case "6", "6,hardfloat":
+			goarch = "armv6"
+		case "7", "7,hardfloat":
+			goarch = "armv7"
+		default:
+			// Published ARMv6/v7 assets require hardware floating point. Skip
+			// softfloat builds and unknown settings rather than risk an upgrade
+			// the CPU cannot run.
+			return ""
+		}
+	}
 	name := fmt.Sprintf("cf-probe-%s-%s", goos, goarch)
 	if goos == "windows" {
 		name += ".exe"
@@ -264,7 +347,7 @@ func scheduleUpdateInstall(paths Paths, binPath string, now int64) (string, erro
 	if paths.UserMode {
 		return scheduleUserModeUpdateInstall(paths, binPath)
 	}
-	return scheduleUnixUpdateInstall(paths.ServiceName, paths.LogFile, binPath, now)
+	return scheduleUnixUpdateInstall(paths.ServiceName, paths.Instance, paths.LogFile, binPath, now)
 }
 
 // fetchUpdateBinary 通过更新专用 HTTP 客户端下载目标版本二进制到配置目录，
@@ -284,25 +367,30 @@ func fetchUpdateBinary(configDir string, candidate updateCandidate, proxy string
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	client := newUpdateHTTPClient(5*time.Minute, usePublicDNS)
-	checksums, checksumErr := downloadUpdateChecksums(ctx, client, candidate.TagName, proxy)
+	defer client.CloseIdleConnections()
+	checksums, err := downloadUpdateChecksums(ctx, client, candidate.TagName, proxy)
+	if err != nil {
+		return "", fmt.Errorf("download update checksums: %w", err)
+	}
+	expected, ok := checksumForAsset(checksums, candidate.AssetName)
+	if !ok {
+		return "", fmt.Errorf("checksum missing for %s", candidate.AssetName)
+	}
 	if err := downloadToFile(ctx, client, rawURL, dest); err != nil {
 		return "", err
 	}
-	if checksumErr == nil {
-		expected, ok := checksumForAsset(checksums, candidate.AssetName)
-		if !ok {
-			_ = os.Remove(dest)
-			return "", fmt.Errorf("checksum missing for %s", candidate.AssetName)
-		}
-		if err := verifyFileSHA256(dest, expected); err != nil {
-			_ = os.Remove(dest)
-			return "", err
-		}
+	if err := verifyFileSHA256(dest, expected); err != nil {
+		_ = os.Remove(dest)
+		return "", err
 	}
 	return dest, nil
 }
 
 func downloadToFile(ctx context.Context, client *http.Client, rawURL, dest string) error {
+	return downloadToFileWithLimit(ctx, client, rawURL, dest, 512<<20)
+}
+
+func downloadToFileWithLimit(ctx context.Context, client *http.Client, rawURL, dest string, maxBytes int64) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return err
@@ -316,12 +404,15 @@ func downloadToFile(ctx context.Context, client *http.Client, rawURL, dest strin
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("download %s returned http %d", rawURL, resp.StatusCode)
 	}
+	if resp.ContentLength > maxBytes {
+		return fmt.Errorf("download %s exceeded %d bytes", rawURL, maxBytes)
+	}
 	tmp := dest + ".download"
 	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
 	if err != nil {
 		return err
 	}
-	_, copyErr := io.Copy(out, io.LimitReader(resp.Body, 512<<20))
+	written, copyErr := io.Copy(out, io.LimitReader(resp.Body, maxBytes+1))
 	closeErr := out.Close()
 	if copyErr != nil {
 		_ = os.Remove(tmp)
@@ -330,6 +421,10 @@ func downloadToFile(ctx context.Context, client *http.Client, rawURL, dest strin
 	if closeErr != nil {
 		_ = os.Remove(tmp)
 		return closeErr
+	}
+	if written == 0 || written > maxBytes {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("download %s has invalid size %d (limit %d)", rawURL, written, maxBytes)
 	}
 	if err := os.Chmod(tmp, 0o755); err != nil {
 		_ = os.Remove(tmp)
@@ -413,9 +508,13 @@ func verifyFileSHA256(path, expected string) error {
 	}
 	return nil
 }
-func scheduleUnixUpdateInstall(serviceName, logFile, binPath string, now int64) (string, error) {
-	cmdLine := fmt.Sprintf("sleep %d; %s install; rm -f %s",
-		int(autoUpdateDelay.Seconds()), quoteShell(binPath), quoteShell(binPath))
+func scheduleUnixUpdateInstall(serviceName, instance, logFile, binPath string, now int64) (string, error) {
+	installArgs := "install"
+	if instance != "" {
+		installArgs += " -instance=" + instance
+	}
+	cmdLine := fmt.Sprintf("sleep %d; %s %s; rm -f %s",
+		int(autoUpdateDelay.Seconds()), quoteShell(binPath), installArgs, quoteShell(binPath))
 	if runtime.GOOS == "linux" && !isSynology() && fileExists("/run/systemd/system") {
 		unit := fmt.Sprintf("%s-auto-update-%d", serviceName, now)
 		if commandExists("systemd-run") {
@@ -442,10 +541,14 @@ func scheduleUnixUpdateInstall(serviceName, logFile, binPath string, now int64) 
 }
 
 func scheduleWindowsUpdateInstall(paths Paths, binPath string) (string, error) {
+	applyArgs := "upgrade-apply"
+	if paths.Instance != "" {
+		applyArgs += " -instance=" + paths.Instance
+	}
 	script := strings.Join([]string{
 		"$ErrorActionPreference = 'Continue'",
 		fmt.Sprintf("Start-Sleep -Seconds %d", int(autoUpdateDelay.Seconds())),
-		"& " + powerShellLiteral(binPath) + " upgrade-apply >> " + powerShellLiteral(paths.LogFile) + " 2>&1",
+		"& " + powerShellLiteral(binPath) + " " + applyArgs + " >> " + powerShellLiteral(paths.LogFile) + " 2>&1",
 		"if ($LASTEXITCODE -eq 0) { Remove-Item -LiteralPath " + powerShellLiteral(binPath) + " -Force -ErrorAction SilentlyContinue }",
 	}, "; ")
 	cmd := exec.Command("powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", script)
@@ -456,11 +559,11 @@ func scheduleWindowsUpdateInstall(paths Paths, binPath string) (string, error) {
 	return "powershell", nil
 }
 
-func ApplyScheduledUpdate(buildVersion string) error {
+func ApplyScheduledUpdate(instance, buildVersion string) error {
 	if runtime.GOOS != "windows" {
 		return errors.New("scheduled upgrade apply is only supported on Windows")
 	}
-	paths := defaultPaths()
+	paths := pathsForInstance(instance)
 	fmt.Printf("[INFO] applying scheduled update version=%s target=%s\n", buildVersion, paths.BinaryFile)
 	return applyWindowsScheduledUpdate(paths)
 }

@@ -101,28 +101,45 @@ func readMemoryStats() (MemoryStats, bool) {
 	}, true
 }
 
-func readNetBytes(ifaces string) NetBytes {
+func readNetBytes(ifaces string) (NetBytes, error) {
 	wanted := splitInterfaceSet(ifaces)
 	var total NetBytes
-	_ = scanFile("/proc/net/dev", func(line string) {
+	var parseErr error
+	matched := 0
+	err := scanFile("/proc/net/dev", func(line string) {
 		if !strings.Contains(line, ":") {
 			return
 		}
 		name, rest, _ := strings.Cut(strings.TrimSpace(line), ":")
 		name = strings.TrimSpace(name)
 		fields := strings.Fields(rest)
-		if len(fields) < 16 {
-			return
-		}
 		if !shouldIncludeNetInterface(name, wanted) {
 			return
 		}
-		rx, _ := strconv.ParseUint(fields[0], 10, 64)
-		tx, _ := strconv.ParseUint(fields[8], 10, 64)
+		if len(fields) < 16 {
+			parseErr = fmt.Errorf("invalid network counters for %s", name)
+			return
+		}
+		rx, rxErr := strconv.ParseUint(fields[0], 10, 64)
+		tx, txErr := strconv.ParseUint(fields[8], 10, 64)
+		if rxErr != nil || txErr != nil {
+			parseErr = fmt.Errorf("invalid network counters for %s", name)
+			return
+		}
 		total.RX += rx
 		total.TX += tx
+		matched++
 	})
-	return total
+	if err != nil {
+		return NetBytes{}, err
+	}
+	if parseErr != nil {
+		return NetBytes{}, parseErr
+	}
+	if matched == 0 {
+		return NetBytes{}, fmt.Errorf("no matching network interfaces")
+	}
+	return total, nil
 }
 
 func readMemInfo() map[string]uint64 {
@@ -264,13 +281,6 @@ func linuxConnCount(name string) int {
 	return count
 }
 
-type diskUsageEntry struct {
-	total     uint64
-	used      uint64
-	device    DiskDeviceRef
-	hasDevice bool
-}
-
 func diskUsageLinux() (uint64, uint64, []DiskDeviceRef) {
 	devices := map[string]diskUsageEntry{}
 	_ = scanFile("/proc/mounts", func(line string) {
@@ -302,14 +312,19 @@ func diskUsageLinux() (uint64, uint64, []DiskDeviceRef) {
 			}
 		}
 		device, hasDevice := linuxDiskDeviceRef(dev, mountPoint, deviceID)
-		entry := diskUsageEntry{total: size, used: used, device: device, hasDevice: hasDevice}
+		entry := diskUsageEntry{
+			total:       size,
+			used:        used,
+			device:      device,
+			hasDevice:   hasDevice,
+			overlayView: isOverlayViewMount(fsType),
+		}
 		// Dedup by the underlying filesystem id (statfs f_fsid) rather than the
-		// device name, so a single physical disk is counted once even when it
-		// appears twice inside a container: once as the overlay root ("/") and
-		// again as a bind-mounted volume (e.g. "/data"), which carry different
-		// device strings but share f_fsid. Fall back to the device string when
+		// device name, so a single physical disk is counted once when it is
+		// bind-mounted at several paths. Fall back to the device string when
 		// f_fsid is unset so distinct real disks are never wrongly merged.
-		dedupKey := linuxMountFsidKey(&st)
+		// ZFS datasets are the exception: see linuxMountDedupKey.
+		dedupKey := linuxMountDedupKey(fsType, deviceID, &st)
 		if existing, ok := devices[dedupKey]; dedupKey == "" {
 			dedupKey = deviceID
 		} else if ok && distinctBlockDevices(deviceID, existing.device.Key) {
@@ -321,6 +336,10 @@ func diskUsageLinux() (uint64, uint64, []DiskDeviceRef) {
 			devices[dedupKey] = entry
 		}
 	})
+	// f_fsid cannot fold an overlayfs view into its backing filesystem: the
+	// overlay root reports the same block counts as the real device but the
+	// kernel gives it a synthesized f_fsid. Merge those views explicitly.
+	dropOverlayViewDuplicates(devices)
 	var total, used uint64
 	diskDevices := make([]DiskDeviceRef, 0, len(devices))
 	for _, entry := range devices {
@@ -344,6 +363,19 @@ func linuxMountFsidKey(st *syscall.Statfs_t) string {
 		return ""
 	}
 	return fmt.Sprintf("fsid:%d:%d", int64(st.Fsid.X__val[0]), int64(st.Fsid.X__val[1]))
+}
+
+// linuxMountDedupKey builds the dedup key for one mount. ZFS datasets of the
+// same pool share one capacity pool but carry a distinct f_fsid each, so f_fsid
+// would count every dataset of a container host separately (Incus/LXD, TrueNAS,
+// Proxmox, CSI). Fold them by pool name instead: deviceID has already been
+// truncated to the pool for zfs, and diskEntryPreferred keeps the largest view
+// of that pool. Every other filesystem keeps the f_fsid key unchanged.
+func linuxMountDedupKey(fsType, deviceID string, st *syscall.Statfs_t) string {
+	if strings.EqualFold(fsType, "zfs") && deviceID != "" {
+		return "zfs:" + deviceID
+	}
+	return linuxMountFsidKey(st)
 }
 
 // distinctBlockDevices reports whether two mount sources are two *different*
@@ -490,7 +522,11 @@ func includeLinuxMount(dev, mountPoint, fsType, opts string) bool {
 	if fsTypeLower == "fuseblk" {
 		return true
 	}
-	for _, excluded := range []string{"tmpfs", "devtmpfs", "udev", "nfs", "cifs", "smb", "vboxsf", "9p", "fuse", "overlay", "proc", "devpts", "sysfs", "cgroup", "mqueue", "hugetlbfs", "debugfs", "binfmt_misc", "securityfs"} {
+	// trimafs is fnOS's (飞牛) union/view filesystem mounted at /fs: it exposes the
+	// storage pools that are already mounted under /vol1, /vol2 ... and reports
+	// the same capacity with a different f_fsid, so counting it makes the same
+	// physical disk show up twice (a 2 TB disk reported as ~4 TB).
+	for _, excluded := range []string{"trimafs", "tmpfs", "devtmpfs", "udev", "nfs", "cifs", "smb", "vboxsf", "9p", "fuse", "overlay", "proc", "devpts", "sysfs", "cgroup", "mqueue", "hugetlbfs", "debugfs", "binfmt_misc", "securityfs"} {
 		if fsTypeLower == excluded || strings.HasPrefix(fsTypeLower, excluded) {
 			return false
 		}

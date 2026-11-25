@@ -219,3 +219,22 @@ func TestLatencyLiveCoversUploadLag(t *testing.T) {
 		t.Fatal("live buffer cannot hold 8 routes over the window")
 	}
 }
+
+// The custom installer runs `install ... -auto_update=0 --no-start`, then writes
+// LATENCY_DETAIL before the first start.
+func TestParseInstallOptionsAcceptsNoStart(t *testing.T) {
+	args := []string{"-id=00000000-0000-4000-8000-000000000000", "-secret=s", "-url=https://monitor.example/update", "-auto_update=0"}
+	for _, flag := range []string{"--no-start", "-no_start"} {
+		got, err := parseInstallOptions(append(append([]string{}, args...), flag))
+		if err != nil {
+			t.Fatalf("%s rejected: %v", flag, err)
+		}
+		if !got.NoStart || got.AutoUpdate {
+			t.Fatalf("%s: NoStart=%v AutoUpdate=%v", flag, got.NoStart, got.AutoUpdate)
+		}
+	}
+	got, err := parseInstallOptions(args)
+	if err != nil || got.NoStart {
+		t.Fatalf("default install must start the service: NoStart=%v err=%v", got.NoStart, err)
+	}
+}

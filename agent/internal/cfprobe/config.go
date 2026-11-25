@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 )
@@ -22,6 +21,7 @@ func defaultConfig() Config {
 		ResetDay:        1,
 		ConnectionMode:  connectionModeAuto,
 		PingMode:        pingModeTCP,
+		UA:              defaultUserAgent,
 		ConfigMD5:       "none",
 	}
 }
@@ -63,6 +63,32 @@ func normalizePingMode(raw string) (string, error) {
 	default:
 		return "", fmt.Errorf("ping_mode 仅支持 tcp 或 icmp")
 	}
+}
+
+// normalizeUserAgentValue 校验自定义 UA：必须是 header 安全的可打印 ASCII，且不能包含
+// 引号或反斜杠（会破坏 config.conf 的 KEY="value" 格式）。非法值一律回退默认 UA。
+// userAgentAllowedChars 与服务端 settings.js 的白名单保持一致：只允许在请求头、
+// config.conf 的 KV 格式、安装命令的 shell/PowerShell 引号下都安全的字符。
+const userAgentAllowedChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 _.-/,:;()+=@#*?~"
+
+func isValidUserAgent(value string) bool {
+	if value == "" || len(value) > maxUserAgentLength {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		if strings.IndexByte(userAgentAllowedChars, value[i]) < 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func normalizeUserAgentValue(raw string) string {
+	value := strings.TrimSpace(raw)
+	if isValidUserAgent(value) {
+		return value
+	}
+	return defaultUserAgent
 }
 
 func normalizeInterfaceList(raw string) (string, error) {
@@ -125,6 +151,7 @@ func readConfig(path string) (Config, error) {
 	cfg.ServerID = values["SERVER_ID"]
 	cfg.Secret = values["SECRET"]
 	cfg.WorkerURL = values["WORKER_URL"]
+	cfg.Name = values["NAME"]
 	cfg.CollectInterval = parseIntDefault(values["COLLECT_INTERVAL"], cfg.CollectInterval)
 	cfg.ReportInterval = parseIntDefault(values["REPORT_INTERVAL"], cfg.ReportInterval)
 	cfg.CTNode = values["CT_NODE"]
@@ -139,6 +166,7 @@ func readConfig(path string) (Config, error) {
 	cfg.ResetDay = parseIntDefault(values["RESET_DAY"], cfg.ResetDay)
 	cfg.ConnectionMode, _ = normalizeConnectionMode(values["CONNECTION_MODE"])
 	cfg.PingMode, _ = normalizePingMode(values["PING_MODE"])
+	cfg.UA = normalizeUserAgentValue(values["UA"])
 	cfg.AutoUpdate = values["AUTO_UPDATE"] == "1"
 	cfg.LatencyDetail = values["LATENCY_DETAIL"] == "1"
 	cfg.UpdateProxy = strings.TrimSpace(values["UPDATE_PROXY"])
@@ -162,6 +190,7 @@ func writeConfig(path string, cfg Config) error {
 	writeKV("SERVER_ID", cfg.ServerID)
 	writeKV("SECRET", cfg.Secret)
 	writeKV("WORKER_URL", cfg.WorkerURL)
+	writeKV("NAME", cfg.Name)
 	writeKV("COLLECT_INTERVAL", strconv.Itoa(cfg.CollectInterval))
 	writeKV("REPORT_INTERVAL", strconv.Itoa(cfg.ReportInterval))
 	writeKV("CT_NODE", cfg.CTNode)
@@ -176,6 +205,7 @@ func writeConfig(path string, cfg Config) error {
 	writeKV("RESET_DAY", strconv.Itoa(cfg.ResetDay))
 	writeKV("CONNECTION_MODE", cfg.ConnectionMode)
 	writeKV("PING_MODE", cfg.PingMode)
+	writeKV("UA", cfg.UA)
 	if cfg.AutoUpdate {
 		writeKV("AUTO_UPDATE", "1")
 	} else {
@@ -225,6 +255,7 @@ func normalizeConfigIntervals(cfg *Config) {
 	} else {
 		cfg.PingMode = pingModeTCP
 	}
+	cfg.UA = normalizeUserAgentValue(cfg.UA)
 	cfg.UpdateProxy = strings.TrimSpace(cfg.UpdateProxy)
 }
 
@@ -261,11 +292,3 @@ func splitInterfaceSet(raw string) map[string]bool {
 	return out
 }
 
-func sortedKeys(m map[string]string) []string {
-	keys := make([]string, 0, len(m))
-	for key := range m {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	return keys
-}
