@@ -12,6 +12,7 @@
           {{ customAgentText.title }}
         </label>
         <p class="text-secondary text-sm">{{ customAgentEligible ? customAgentText.ready : customAgentText.disabled }}</p>
+        <p v-if="customAgentAuto" class="text-secondary text-sm">{{ customAgentSlotText }}</p>
         <p v-if="customAgent && targetOs !== 'linux'" class="text-secondary text-sm">{{ customAgentText.unsupported }}</p>
         <label class="form-label">{{ customAgentText.serverId }}</label>
         <input class="form-input" readonly :value="serverId" :aria-label="customAgentText.serverId" @focus="$event.target.select()">
@@ -193,6 +194,10 @@ const props = defineProps({
   copiedCmd: { type: Boolean, default: false },
   customAgent: { type: Boolean, default: false },
   customAgentEligible: { type: Boolean, default: false },
+  customAgentEnrolled: { type: Boolean, default: false },
+  customAgentAuto: { type: Boolean, default: false },
+  customAgentSlotsUsed: { type: Number, default: 0 },
+  customAgentSlotsMax: { type: Number, default: 0 },
   customAgentVersion: { type: String, default: '' }
 })
 
@@ -209,16 +214,26 @@ const emit = defineEmits([
 
 const customAgentText = computed(() => currentLang.value === 'zh' ? {
   title: '定制高密度历史探针',
-  serverId: '节点 ID（点击选中，可复制到高密度白名单）',
+  serverId: '节点 ID（点击选中）',
   ready: 'Linux systemd · amd64 / arm64 · 自动备份、校验下载、禁用官方自动更新。请保持原安装用户。',
-  disabled: '当前节点未启用高密度记录；核对免费用量后，将节点 ID 追加到 Cloudflare 的 LATENCY_DETAIL_SERVER_IDS（最多六台），再刷新后台。',
+  disabled: '高密度记录位置已满或尚未启用；删除不用的节点会自动释放位置。',
   unsupported: '定制版仅提供 Linux systemd 程序；请选择 Linux，或取消勾选后使用官方探针。'
 } : {
   title: 'Custom dense-history Agent',
-  serverId: 'Node ID (click to select and copy to the dense-history allowlist)',
+  serverId: 'Node ID (click to select)',
   ready: 'Linux systemd · amd64 / arm64 · Verified download and backup; official auto-update disabled. Keep the original installation user.',
-  disabled: 'This node is not enabled. Review free usage, append its ID to LATENCY_DETAIL_SERVER_IDS in Cloudflare (six nodes maximum), then refresh the admin page.',
+  disabled: 'Dense-history slots are full or not enabled; deleting an unused node frees its slot.',
   unsupported: 'The custom release supports Linux systemd only. Select Linux, or uncheck this option to use the official Agent.'
+})
+
+const customAgentSlotText = computed(() => {
+  const used = props.customAgentSlotsUsed, max = props.customAgentSlotsMax
+  if (currentLang.value === 'zh') return props.customAgentEnrolled
+    ? `本节点已登记高密度记录（已用 ${used}/${max}）。`
+    : `安装后自动登记高密度记录（已用 ${used}/${max}）。`
+  return props.customAgentEnrolled
+    ? `This node is enrolled for dense history (${used}/${max} slots used).`
+    : `Installing enrols this node for dense history (${used}/${max} slots used).`
 })
 
 const CUSTOM_GH_PROXY_VALUE = '__custom__'

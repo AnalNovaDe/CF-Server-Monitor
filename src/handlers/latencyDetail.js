@@ -10,10 +10,77 @@ server_id=excluded.server_id, minute=excluded.minute, samples=excluded.samples
 WHERE excluded.minute > latency_detail.minute`;
 const json = (body, status = 200) => Response.json(body, { status, headers: { 'Cache-Control': 'no-store' } });
 
+// Legacy allowlist (Cloudflare variable). Before migration 002 it is the whole list (at most six,
+// fail closed); after it, it only seeds the registry once, keeping each node's existing slot.
 export function detailNodes(env) {
   const ids = [...new Set(String(env.LATENCY_DETAIL_SERVER_IDS || '').split(',').map(s => s.trim()).filter(Boolean))];
-  // Fail closed. This feature never enables itself or expands beyond six nodes.
   return ids.length <= 6 ? ids : [];
+}
+
+// Migration 002: nodes enrol themselves when the custom Agent is installed or first uploads, up to
+// MAX_DETAIL_NODES (about 1,440 D1 rows written per node per day). Deleting a server frees its slot.
+export const MAX_DETAIL_NODES = 10;
+const REGISTRY_RECHECK_MS = 60000;
+let registryState = { ready: false, checkedAt: 0 };
+
+export function resetDetailRegistryCache() { registryState = { ready: false, checkedAt: 0 }; }
+
+async function registryReady(db) {
+  if (registryState.ready) return true;
+  if (Date.now() - registryState.checkedAt < REGISTRY_RECHECK_MS) return false;
+  try {
+    await db.prepare('SELECT server_slot FROM latency_detail_nodes LIMIT 0').all();
+    registryState = { ready: true, checkedAt: Date.now() };
+  } catch {
+    registryState = { ready: false, checkedAt: Date.now() };
+  }
+  return registryState.ready;
+}
+
+const ENROL_SQL = `INSERT OR IGNORE INTO latency_detail_nodes (server_slot, server_id, enrolled_at)
+SELECT free.s, ?1, ?2 FROM (
+  WITH RECURSIVE n(s) AS (SELECT 0 UNION ALL SELECT s + 1 FROM n WHERE s < ${MAX_DETAIL_NODES - 1})
+  SELECT s FROM n WHERE s NOT IN (SELECT server_slot FROM latency_detail_nodes) ORDER BY s LIMIT 1
+) AS free WHERE EXISTS (SELECT 1 FROM servers WHERE id = ?1)`;
+
+async function seedRegistry(env) {
+  const row = await env.DB.prepare('SELECT COUNT(*) AS n FROM latency_detail_nodes').first();
+  if (Number(row?.n) > 0) return;
+  const ids = detailNodes(env);
+  if (!ids.length) return;
+  await env.DB.batch(ids.map((id, slot) => env.DB.prepare(
+    'INSERT OR IGNORE INTO latency_detail_nodes (server_slot, server_id, enrolled_at) SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM servers WHERE id = ?)'
+  ).bind(slot, id, Date.now(), id)));
+}
+
+// Returns the node's ring slot, or -1. With enrol, frees slots of deleted servers and claims the
+// lowest free slot for an existing server.
+export async function resolveDetailSlot(env, id, { enrol = false } = {}) {
+  if (!await registryReady(env.DB)) return detailNodes(env).indexOf(id);
+  await seedRegistry(env);
+  const find = async () => (await env.DB.prepare('SELECT server_slot FROM latency_detail_nodes WHERE server_id = ?').bind(id).first())?.server_slot;
+  let slot = await find();
+  if (slot === undefined && enrol) {
+    await env.DB.prepare('DELETE FROM latency_detail_nodes WHERE server_id NOT IN (SELECT id FROM servers)').run();
+    const claimed = await env.DB.prepare(ENROL_SQL).bind(id, Date.now()).run();
+    slot = await find();
+    // A reused slot may still hold a deleted node's minutes; clear them once (primary-key prefix,
+    // at most 1,440 rows) so the newcomer's first minutes are never refused as duplicates.
+    if (Number.isInteger(slot) && claimed.meta?.changes > 0) {
+      await env.DB.prepare('DELETE FROM latency_detail WHERE server_slot = ? AND server_id <> ?').bind(slot, id).run();
+    }
+  }
+  return Number.isInteger(slot) ? slot : -1;
+}
+
+// For the admin page: enrolled nodes, capacity and whether new nodes enrol automatically.
+export async function listDetailNodes(env) {
+  if (!await registryReady(env.DB)) return { ids: detailNodes(env), max: 6, auto: false };
+  await seedRegistry(env);
+  const { results = [] } = await env.DB.prepare(
+    'SELECT n.server_id FROM latency_detail_nodes n JOIN servers s ON s.id = n.server_id ORDER BY n.server_slot'
+  ).all();
+  return { ids: results.map(r => r.server_id), max: MAX_DETAIL_NODES, auto: true };
 }
 
 export function validateBlock(block, now = Date.now()) {
@@ -59,9 +126,13 @@ export async function handleLatencyUpload(request, env) {
   let data;
   try { data = await boundedJSON(request); } catch { return json({ error: 'Invalid payload' }, 400); }
   if (!data || typeof data !== 'object' || Array.isArray(data)) return json({ error: 'Invalid payload' }, 400);
-  const serverSlot = detailNodes(env).indexOf(data.id);
-  if (serverSlot < 0) return json({ error: 'Latency detail is not enabled for this node' }, 403);
-  if (!await getServerDetail(env.DB, data.id, true)) return json({ error: 'Not found' }, 404);
+  if (typeof data.id !== 'string' || !await getServerDetail(env.DB, data.id, true)) return json({ error: 'Not found' }, 404);
+  let serverSlot;
+  try { serverSlot = await resolveDetailSlot(env, data.id, { enrol: true }); } catch (e) {
+    console.error('[latency-detail] enrol failed', e.message);
+    return json({ error: 'Latency storage unavailable; check migration and D1 usage' }, 503);
+  }
+  if (serverSlot < 0) return json({ error: 'Latency detail is not enabled for this node (all slots in use)' }, 403);
   let blocks;
   try {
     if (!Array.isArray(data.blocks) || !data.blocks.length || data.blocks.length > 5) throw new Error('invalid block count');
@@ -84,9 +155,9 @@ export async function handleLatencyInstallCheck(request, env) {
   let data;
   try { data = await boundedJSON(request); } catch { return json({ error: 'Invalid payload' }, 400); }
   if (!data || typeof data.id !== 'string') return json({ error: 'Invalid server ID' }, 400);
-  if (!detailNodes(env).includes(data.id)) return json({ error: 'Latency detail is not enabled for this node' }, 403);
   if (!await getServerDetail(env.DB, data.id, true)) return json({ error: 'Not found' }, 404);
   try {
+    if (await resolveDetailSlot(env, data.id, { enrol: true }) < 0) return json({ error: 'Latency detail is not enabled for this node (all slots in use)' }, 403);
     await env.DB.prepare('SELECT server_slot FROM latency_detail LIMIT 0').all();
     return json({ enabled: true, version: '1.0.19-latency.5' });
   } catch { return json({ error: 'Latency storage unavailable; check migration and D1 usage' }, 503); }
@@ -119,7 +190,8 @@ export async function handleLatencyHistory(request, env, sys, ctx) {
   if (sys.is_public !== 'true' && !loggedIn) return simpleAuthResponse();
   const url = new URL(request.url), id = url.searchParams.get('id');
   if (!id || !await getServerDetail(env.DB, id, loggedIn)) return json({ error: 'Not found' }, 404);
-  const serverSlot = detailNodes(env).indexOf(id);
+  let serverSlot;
+  try { serverSlot = await resolveDetailSlot(env, id); } catch { serverSlot = -1; }
   if (serverSlot < 0) return json({ enabled: false, samples: [] });
   const now = Date.now(), latest = Math.floor(now / MINUTE) - 1;
   const after = Number(url.searchParams.get('after') || 0);
