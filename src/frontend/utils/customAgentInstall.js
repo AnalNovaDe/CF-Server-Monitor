@@ -1,6 +1,6 @@
 export const CUSTOM_INSTALLER_RELEASE = 'https://github.com/AnalNovaDe/CF-Server-Monitor/releases/download/agent-installer-1.0.5'
 export const CUSTOM_AGENT_VERSION = '1.1.4-latency.1'
-export const CUSTOM_INSTALLER_SHA256 = 'fc652d7eacac7553ccbce6d07f1fdc5479569c10e28030b898ae3ce5ee4a2190'
+export const CUSTOM_INSTALLER_SHA256 = '478a0b22b1dd15bfa46c97dfea25ee46f5db4a046527f838b180760373ff1a5c'
 const quote = value => `'${String(value).replaceAll("'", `'"'"'`)}'`
 
 export function buildCustomAgentInstallCommand({ serverId, secret, baseUrl, options = {} }) {
