@@ -284,6 +284,10 @@
         :copied-cmd="copiedCmd"
         :custom-agent="customAgent"
         :custom-agent-eligible="customAgentEligible"
+        :custom-agent-enrolled="customAgentEnrolled"
+        :custom-agent-auto="latencyDetailAuto"
+        :custom-agent-slots-used="latencyDetailServerIds.length"
+        :custom-agent-slots-max="latencyDetailMax"
         :custom-agent-version="CUSTOM_AGENT_VERSION"
         @close="closeCopyModal"
         @copy-cmd="copyCustomCmd"
@@ -1017,6 +1021,8 @@ const settings = ref({
 })
 const apiSecret = ref('')
 const latencyDetailServerIds = ref([])
+const latencyDetailMax = ref(0)
+const latencyDetailAuto = ref(false)
 const cacheRefreshing = ref(false)
 const savedAutoDiscovery = ref(false)
 const changeAdminPassword = ref(false)
@@ -1160,7 +1166,9 @@ const installMode = ref('current-user')
 const installGhProxy = ref('')
 const installVersion = ref('')
 const customAgent = ref(false)
-const customAgentEligible = computed(() => latencyDetailServerIds.value.includes(copyServerId.value))
+const customAgentEnrolled = computed(() => latencyDetailServerIds.value.includes(copyServerId.value))
+// With automatic enrolment every node may install the custom Agent while a slot is free; it claims one on install.
+const customAgentEligible = computed(() => customAgentEnrolled.value || (latencyDetailAuto.value && latencyDetailServerIds.value.length < latencyDetailMax.value))
 const collectInterval = ref(0)
 const reportInterval = ref(60)
 const wssReportInterval = ref(2)
@@ -1407,6 +1415,8 @@ const loadLatestAgentVersion = async () => {
 
 const loadSettings = async () => {
   latencyDetailServerIds.value = []
+  latencyDetailMax.value = 0
+  latencyDetailAuto.value = false
   try {
     const result = await adminApiForSite({ action: 'get_settings' })
     if (!result.error) {
@@ -1479,6 +1489,8 @@ const loadSettings = async () => {
       changeAdminPassword.value = !settings.value.password_configured || !String(settings.value.username || '').trim()
       apiSecret.value = data.api_secret || ''
       latencyDetailServerIds.value = Array.isArray(data.latency_detail_server_ids) ? data.latency_detail_server_ids : []
+      latencyDetailMax.value = Number(data.latency_detail_max) || 0
+      latencyDetailAuto.value = data.latency_detail_auto === true
       // 只有已保存到服务端的自动发现开关才提供复制安装命令，避免复制出当前并未生效的命令
       savedAutoDiscovery.value = settings.value.auto_discovery
     }
@@ -1816,7 +1828,7 @@ const copyCmd = (serverId) => {
   installMode.value = 'current-user'
   installGhProxy.value = ''
   installVersion.value = ''
-  customAgent.value = latencyDetailServerIds.value.includes(serverId)
+  customAgent.value = customAgentEligible.value
   if (customAgent.value) installMode.value = 'cfsm-user'
   collectInterval.value = server?.collect_interval ?? 0
   reportInterval.value = server?.report_interval || 60

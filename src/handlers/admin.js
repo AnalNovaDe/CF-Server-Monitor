@@ -14,7 +14,7 @@ import { isValidTrafficCorrection, normalizeConnectionMode, normalizePingMode, n
 import { scheduleAgentConfigChanged, scheduleAgentReportModeChanged } from '../utils/agentConfigNotify.js';
 import { detectBillingCycle, detectCurrencySymbol, normalizeBillingCycle, normalizeCurrency, normalizePrice, renewExpireDateIfNeeded } from '../utils/serverBilling.js';
 import { THEME_PREVIEW_AUTH_TTL_SECONDS } from '../utils/config.js';
-import { detailNodes } from './latencyDetail.js';
+import { listDetailNodes } from './latencyDetail.js';
 
 const PING_NODE_FIELDS = ['custom_ct', 'custom_cu', 'custom_cm', 'custom_bd', 'node_1', 'node_2', 'node_3', 'node_4'];
 const THEME_PREVIEW_AUTH_COOKIE = 'cfsm_theme_preview_auth';
@@ -570,7 +570,14 @@ async function handleGetSettingsAction({ env, sys, loadFullSettings }) {
     success: true,
     settings: sanitizeAdminSettings(fullSettings),
     api_secret: env.API_SECRET,
-    latency_detail_server_ids: detailNodes(env)
+    ...await (async () => {
+      try {
+        const nodes = await listDetailNodes(env);
+        return { latency_detail_server_ids: nodes.ids, latency_detail_max: nodes.max, latency_detail_auto: nodes.auto };
+      } catch {
+        return { latency_detail_server_ids: [], latency_detail_max: 0, latency_detail_auto: false };
+      }
+    })()
   });
 }
 

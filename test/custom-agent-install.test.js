@@ -33,18 +33,20 @@ test('copy command pins the published installer and quotes server settings liter
   assert.equal(buildCustomAgentInstallCommand({serverId:'invalid',secret,baseUrl:'https://monitor.example'}),'');
 });
 
-test('installation readiness enforces auth, six-node opt-in, server existence and storage availability without writes', async () => {
+test('installation readiness (before migration 002) enforces auth, six-node opt-in, server existence and storage availability without writes', async () => {
   const queries = [];
   let exists = true, storage = true;
   const env = {API_SECRET:'test-secret',LATENCY_DETAIL_SERVER_IDS:id,DB:{prepare(sql){
     queries.push(sql);
+    // Pre-migration-002 database: the enrolment registry does not exist yet.
+    if(sql.includes('latency_detail_nodes'))return {async all(){throw Error('no such table')}};
     return {bind(){return {async first(){return exists?{id,is_hidden:1}:null}}},async all(){if(!storage)throw Error('unavailable');return {results:[]}}};
   }}};
   const request = (secret='test-secret',body={id}) => new Request('https://test/update/latency-check',{method:'POST',headers:{Authorization:`Bearer ${secret}`},body:JSON.stringify(body)});
   assert.equal((await handleLatencyInstallCheck(request('wrong'),env)).status,401);
   assert.equal(queries.length,0);
   assert.equal((await handleLatencyInstallCheck(request('test-secret',{id:'not-enabled'}),env)).status,403);
-  assert.equal(queries.length,0);
+  clearServersListCache();
   assert.equal((await handleLatencyInstallCheck(request(),{...env,LATENCY_DETAIL_SERVER_IDS:'1,2,3,4,5,6,7'})).status,403);
   clearServersListCache();
   exists=false;
