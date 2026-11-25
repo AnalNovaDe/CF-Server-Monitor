@@ -1,4 +1,4 @@
-# 自定义 Agent 1.0.19-latency.3
+# 自定义 Agent 1.1.4-latency.1
 
 上游基线：3e7353c82a25d3845ec5cffa45f053dbc3301559，Go 1.26.8。
 
@@ -12,6 +12,11 @@ latency.4：资源上报使用的 TCP 探测把握手超时设为 900 ms，低�
 
 latency.5：实时回显覆盖最近 150 秒（内存最多 180 秒/72 条），分钟块改为每分钟结束后约 3 秒上传（原为相位随机的每分钟定时器，最长滞后近 2 分钟）。页面任意时刻打开时，已存历史与实时回显之间不再有空档。不新增请求。
 
+1.1.4-latency.1：改为基于上游 huilang-me/cfsm-agent v1.1.4（4645cca），带入上游 1.0.20–1.1.4 的全部改进（上报熔断与退避、服务端下发 User-Agent、流量采样与安装稳定性、非 root 用户 systemd linger、ZFS/overlay/飞牛磁盘去重、多实例安装、Go 1.27.3 与依赖更新）。定制部分与 latency.5 相同：20 秒密集探测与分钟块上传、实时回显、900 ms TCP 握手超时、定制模式下关闭自动更新。本版另外：
+- 密集数据上传带上与指标上报相同的 User-Agent（站点 UA 规则不会只拦截这一路）。
+- 定制模式下，更新检查入口也直接跳过（除已关闭的自动更新线程外再加一道保护）。
+- 恢复上游已删除的 install --no-start 参数，供定制安装脚本在首次启动前写入 LATENCY_DETAIL/AUTO_UPDATE。
+
 源码现位于 Worker 仓库 agent/ 目录，由 .github/workflows/custom-agent.yml 在 GitHub Actions 中测试和交叉编译（-trimpath -buildvcs=false，可重复构建），推送 agent-<版本> tag 时核对安装脚本中的 SHA256 后发布 Release。
 
 必须先部署配套 Worker、执行新增表 SQL、在 Worker 变量 LATENCY_DETAIL_SERVER_IDS 中加入本机 UUID，才启用本功能。
@@ -23,8 +28,8 @@ latency.5：实时回显覆盖最近 150 秒（内存最多 180 秒/72 条），
 构建：
 
 ```sh
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags '-s -w -X main.version=1.0.19-latency.3' -o cf-probe-linux-amd64 ./cmd/cf-probe
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags '-s -w -X main.version=1.0.19-latency.3' -o cf-probe-linux-arm64 ./cmd/cf-probe
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags '-s -w -X main.version=1.1.4-latency.1' -o cf-probe-linux-amd64 ./cmd/cf-probe
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -buildvcs=false -ldflags '-s -w -X main.version=1.1.4-latency.1' -o cf-probe-linux-arm64 ./cmd/cf-probe
 ```
 
 安装前备份现有程序和配置，按已有服务的真实二进制路径替换，保留服务用户/权限和配置路径。不要重跑会下载上游程序的官方安装脚本，否则将覆盖自定义程序。latency.1 已进行单节点真实采样试点；latency.2 完成本机回归后另行升级，不把模拟时间测试当作生产持续运行验收。

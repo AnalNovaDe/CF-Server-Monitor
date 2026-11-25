@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -27,6 +28,14 @@ type Agent struct {
 	log     logger
 	version string
 	ctx     context.Context
+
+	// 自动建号失败后置位：本次运行不再重试建号，也不再上报（空 id 的上报必然 404）。
+	discoveryFailed atomic.Bool
+	// 建号成功的那一次上报只用来取 id：置位后由 applyReportResult 丢弃该次上报的节奏记录，
+	// 让下一次 tick 立刻带着新 id 再上报一次，服务端才能按正常安装的流程比对 md5 并入库。
+	discoveryJustBound atomic.Bool
+	// 上面那次“带 id 的补报”完成后才启动 WSS，保证补报一定走 POST（md5 比对 + 入库）。
+	discoverySyncPending atomic.Bool
 
 	mu         sync.RWMutex
 	probes     ProbeSnapshot
@@ -49,8 +58,26 @@ type Agent struct {
 	lastPostAttempt          time.Time
 	lastConfigStateReportAt  time.Time
 	lastConfigStateReportMD5 string
-	updateMu                 sync.Mutex
-	reporter                 *reportTransport
+	// 上一次被拒的配置原因：同一份坏配置服务端会持续重发，只提示一次。
+	lastConfigRejectKey string
+	// 自动发现拿到但没能写入配置文件的 id，后续上报会重试落盘。
+	pendingPersistID string
+	updateMu         sync.Mutex
+	// configWriteMu 串行化配置文件写入：动态配置下发与 UA 下发是两条独立通道，
+	// 并发写会把对方的字段覆盖回旧值。
+	configWriteMu    sync.Mutex
+	reporter         *reportTransport
+	reportMu         sync.Mutex
+	// reportFailures 是 WSS 与 POST 共用的连续失败计数：握手 401/403、WSS error 帧、
+	// POST 4xx/5xx、WS close 1008 都计入，任意一次成功（POST 2xx、非实时提示 ack、
+	// 或 WSS 握手通过）清零。
+	// 代价是两类通道互相干扰，例如 WSS 持续被拒而 POST 兜底偶发成功时计数会来回震荡，
+	// 熔断可能不触发；当前接受该误差，若后续需要区分通道再拆成独立计数器。
+	reportFailures    int
+	reportPausedUntil time.Time
+	reportBackoff     time.Duration
+	// lastReportFailureAt 用于失败计数衰减：超过 reportFailureDecay 没有新失败就重新计数。
+	lastReportFailureAt      time.Time
 	wake                     chan struct{}
 	remoteConfig             chan remoteConfigRequest
 	wssRuntimeMu             sync.Mutex
@@ -66,13 +93,43 @@ const (
 	metricsProbeWindowSampleCount = 6
 	metricsProbeSampleCount       = 1
 	configStateReportInterval     = time.Minute
-	agentWSSModeHeader            = "X-Agent-Wss-Mode"
-	agentWSSReasonHeader          = "X-Agent-Wss-Reason"
-	agentWSSModeActive            = "active"
-	agentWSSModeInactive          = "inactive"
-	agentWSSScheduleInactive      = "wss_schedule_inactive"
-	agentWSSScheduleEmpty         = "wss_schedule_empty"
+	// 连续服务端拒绝后开始退避；只影响上报与采样。WSS 建连不再受暂停限制，
+	// 配置下发与自动更新不受影响；HTTP 模式下的配置仍依赖 POST 2xx 响应体。
+	reportFailureThreshold = 3
+	reportBackoffMax       = 10 * time.Minute
+	// 超过该时长没有新的失败，连续失败计数归零，避免历史故障让后续单次失败直接跳到最高档。
+	reportFailureDecay       = 30 * time.Minute
+	agentWSSModeHeader       = "X-Agent-Wss-Mode"
+	agentWSSReasonHeader     = "X-Agent-Wss-Reason"
+	agentWSSModeActive       = "active"
+	agentWSSModeInactive     = "inactive"
+	agentWSSScheduleInactive = "wss_schedule_inactive"
+	agentWSSScheduleEmpty    = "wss_schedule_empty"
+
+	// 服务端自动建号结果：created | reused | failed[:code]
+	agentAutoDiscoveryHeader      = "X-CFSM-Auto-Discovery"
+	agentAutoDiscoveryServerIDKey = "X-CFSM-Server-Id"
+	agentAutoDiscoveryCreated     = "created"
+	agentAutoDiscoveryReused      = "reused"
+	agentAutoDiscoveryFailed      = "failed"
+	// agentAutoDiscoveryDisabled 是 Agent 本地判定的中止原因：未绑定 id 时收到
+	// 不带自动发现标记的 404，说明服务端没有开启自动发现（或版本过旧），服务端不会返回这个值。
+	agentAutoDiscoveryDisabled = "disabled"
+	// agentUAHeader 是服务端下发自定义 UA 的响应头 / WSS ack 字段名。
+	agentUAHeader = "X-Ua"
 )
+
+// ErrAutoDiscoveryFailed 表示未绑定 server id 且自动建号无法完成（失败或重名），进程应直接退出。
+var ErrAutoDiscoveryFailed = errors.New("自动建号已中止，cf-probe 退出")
+
+// 连续失败后的暂停时长：2m → 3m → 5m → 7m → 10m，之后保持 10m。
+var reportBackoffSteps = [...]time.Duration{
+	2 * time.Minute,
+	3 * time.Minute,
+	5 * time.Minute,
+	7 * time.Minute,
+	reportBackoffMax,
+}
 
 type timedProbeResult struct {
 	at     time.Time
@@ -151,8 +208,8 @@ func (h rollingProbeHistory) snapshot(now time.Time) ProbeResult {
 	return ProbeResult{RTTMs: medianInt(values), Loss: loss, OK: true}
 }
 
-func Run(configFile string, debug bool, version string) error {
-	paths := defaultPaths()
+func Run(instance, configFile string, debug bool, version string) error {
+	paths := pathsForInstance(instance)
 	if configFile != "" {
 		paths.ConfigFile = configFile
 		paths.ConfigDir = filepath.Dir(configFile)
@@ -168,8 +225,8 @@ func Run(configFile string, debug bool, version string) error {
 	if err != nil {
 		return fmt.Errorf("读取配置失败 %s: %w", paths.ConfigFile, err)
 	}
-	if cfg.ServerID == "" || cfg.Secret == "" || cfg.WorkerURL == "" {
-		return errors.New("配置缺失: SERVER_ID/SECRET/WORKER_URL 不能为空")
+	if cfg.Secret == "" || cfg.WorkerURL == "" {
+		return errors.New("配置缺失: SECRET/WORKER_URL 不能为空")
 	}
 	normalizeConfigIntervals(&cfg)
 
@@ -182,11 +239,10 @@ func Run(configFile string, debug bool, version string) error {
 		log:          newLogger(debug),
 		version:      version,
 		ctx:          ctx,
-		prevNet:      readNetBytes(cfg.Interface),
-		prevTime:     time.Now(),
 		wake:         make(chan struct{}, 1),
 		remoteConfig: make(chan remoteConfigRequest, 4),
 	}
+	a.resetNetworkBaseline(cfg.Interface)
 	a.reporter = newReportTransport(a)
 	a.basic = collectBasicStats()
 	a.basicAt = time.Now()
@@ -201,7 +257,7 @@ func Run(configFile string, debug bool, version string) error {
 	}
 	if a.usesWSS() {
 		a.reporter.start(ctx)
-	} else {
+	} else if cfg.ServerID != "" {
 		a.log.info("WSS disabled connection_mode=http")
 	}
 	if cfg.AutoUpdate && !cfg.LatencyDetail {
@@ -209,7 +265,15 @@ func Run(configFile string, debug bool, version string) error {
 	} else {
 		a.log.info("auto update disabled: local setting or custom latency mode")
 	}
-	return a.loop(ctx)
+	err = a.loop(ctx)
+	if errors.Is(err, ErrAutoDiscoveryFailed) && serviceSystem(paths) == "procd" {
+		// procd 的 respawn 不区分退出码，先删除运行实例，避免自动发现失败后被重新拉起。
+		payload := fmt.Sprintf(`{"name":%q}`, paths.ServiceName)
+		if stopErr := runCommandQuiet("ubus", "call", "service", "delete", payload); stopErr != nil {
+			a.log.warnf("停止 procd 服务失败: %v", stopErr)
+		}
+	}
+	return err
 }
 
 func (a *Agent) loop(ctx context.Context) error {
@@ -222,9 +286,15 @@ func (a *Agent) loop(ctx context.Context) error {
 			return nil
 		case <-timer.C:
 			a.tick()
+			if a.discoveryAbandoned() {
+				return ErrAutoDiscoveryFailed
+			}
 			resetTimer(timer, a.tickInterval())
 		case <-a.wake:
 			a.tick()
+			if a.discoveryAbandoned() {
+				return ErrAutoDiscoveryFailed
+			}
 			resetTimer(timer, a.tickInterval())
 		case req := <-a.remoteConfig:
 			err := a.applyRemoteConfigWithOptions(req.body, req.headers, req.allowMissingMD5)
@@ -255,6 +325,11 @@ func (a *Agent) wakeTick() {
 	case a.wake <- struct{}{}:
 	default:
 	}
+}
+
+// discoveryAbandoned 表示未绑定 server id 且自动建号已中止（失败或重名），进程应退出。
+func (a *Agent) discoveryAbandoned() bool {
+	return a != nil && a.discoveryFailed.Load() && a.configSnapshot().ServerID == ""
 }
 
 func (a *Agent) tickInterval() time.Duration {
@@ -297,10 +372,6 @@ func (a *Agent) currentWSSReportIntervalForConfig(cfg Config) time.Duration {
 	return reportInterval
 }
 
-func (a *Agent) persistentUsesWSS() bool {
-	return persistentUsesWSSConfig(a.configSnapshot())
-}
-
 func persistentUsesWSSConfig(cfg Config) bool {
 	mode, err := normalizeConnectionMode(cfg.ConnectionMode)
 	if err != nil {
@@ -323,6 +394,10 @@ func (a *Agent) usesWSS() bool {
 }
 
 func (a *Agent) usesWSSConfig(cfg Config) bool {
+	// 未绑定 server id 时只走 POST：WSS 通道要求有效 id，空 id 会被直接拒绝。
+	if cfg.ServerID == "" {
+		return false
+	}
 	if !persistentUsesWSSConfig(cfg) {
 		return false
 	}
@@ -339,10 +414,82 @@ func (a *Agent) configSnapshot() Config {
 	return a.cfg
 }
 
+func (a *Agent) requestContext() context.Context {
+	if a != nil && a.ctx != nil {
+		return a.ctx
+	}
+	return context.Background()
+}
+
 func (a *Agent) setConfig(cfg Config) {
 	a.cfgMu.Lock()
 	a.cfg = cfg
 	a.cfgMu.Unlock()
+}
+
+// reportPauseRemaining 返回距离恢复上报的剩余时间，<=0 表示未暂停。
+func (a *Agent) reportPauseRemaining(now time.Time) time.Duration {
+	if a == nil {
+		return 0
+	}
+	a.reportMu.Lock()
+	defer a.reportMu.Unlock()
+	return a.reportPausedUntil.Sub(now)
+}
+
+// noteReportSuccess 清零连续失败并解除熔断。恢复本身不打日志：进入暂停时已有 info，
+// 且每次 ack 都打会刷屏；排障时看 "report paused" 之后再无该日志即表示已恢复。
+func (a *Agent) noteReportSuccess() {
+	if a == nil {
+		return
+	}
+	a.reportMu.Lock()
+	a.reportFailures = 0
+	a.reportPausedUntil = time.Time{}
+	a.reportBackoff = 0
+	a.lastReportFailureAt = time.Time{}
+	a.reportMu.Unlock()
+}
+
+func reportBackoffForFailures(failures int) time.Duration {
+	if failures < reportFailureThreshold {
+		return 0
+	}
+	index := failures - reportFailureThreshold
+	if index >= len(reportBackoffSteps) {
+		index = len(reportBackoffSteps) - 1
+	}
+	return reportBackoffSteps[index]
+}
+
+// noteReportFailure 记录一次服务端拒绝。code 是调用方的原始码：HTTP 状态码，
+// 或 WSS close code（1008），因此日志里的 status 字段不总是 HTTP 语义。
+// 时间基准用 time.Now() 而非 tick 的 now，误差在秒级以内，不影响退避档位。
+func (a *Agent) noteReportFailure(statusCode int) {
+	if a == nil {
+		return
+	}
+	a.reportMu.Lock()
+	now := time.Now()
+	if !a.lastReportFailureAt.IsZero() && now.Sub(a.lastReportFailureAt) >= reportFailureDecay {
+		a.reportFailures = 0
+		a.reportBackoff = 0
+	}
+	a.lastReportFailureAt = now
+	a.reportFailures++
+	failures := a.reportFailures
+	previousBackoff := a.reportBackoff
+	var delay time.Duration
+	if failures >= reportFailureThreshold {
+		a.reportBackoff = reportBackoffForFailures(failures)
+		a.reportPausedUntil = now.Add(a.reportBackoff)
+		delay = a.reportBackoff
+	}
+	a.reportMu.Unlock()
+	// 只在首次触发或退避档位变化时记录，避免达到上限后反复刷日志
+	if delay > 0 && delay != previousBackoff {
+		a.log.info("report paused failures=%d status=%d delay=%s", failures, statusCode, delay)
+	}
 }
 
 func (a *Agent) disableWSSRuntime(reason string) {
@@ -404,8 +551,99 @@ func (a *Agent) handleWSSRuntimeHeaders(headers http.Header) {
 	}
 }
 
+// applyAutoDiscoveryHeaders 处理服务端自动建号结果：
+//   - created：绑定 id 并立即落盘生效，落盘失败也保留内存值，避免下次上报仍为空 id 而重复建号；
+//   - reused：同名服务器已存在，不复用（避免把本机数据写进别人的服务器），提示后退出；
+//   - failed：建号失败，提示后退出，不重试。
+//
+// 退出由 loop 检测 discoveryAbandoned 后完成。
+func (a *Agent) applyAutoDiscoveryHeaders(headers http.Header) {
+	if a == nil || headers == nil {
+		return
+	}
+	raw := strings.ToLower(strings.TrimSpace(headers.Get(agentAutoDiscoveryHeader)))
+	if raw == "" {
+		return
+	}
+
+	status, code, _ := strings.Cut(raw, ":")
+	switch status {
+	case agentAutoDiscoveryCreated:
+		serverID := strings.TrimSpace(headers.Get(agentAutoDiscoveryServerIDKey))
+		if serverID == "" {
+			return
+		}
+		cfg := a.configSnapshot()
+		if cfg.ServerID == serverID {
+			return
+		}
+		nextCfg := cfg
+		nextCfg.ServerID = serverID
+		if err := writeConfig(a.paths.ConfigFile, nextCfg); err != nil {
+			// 只写内存也能继续上报，但重启会丢掉 id，所以后续上报里持续重试写入。
+			a.pendingPersistID = serverID
+			a.log.warnf("自动发现 id 写入配置失败（本次运行仍生效，之后会自动重试）: %v", err)
+		}
+		a.setConfig(nextCfg)
+		a.log.info("自动发现已创建服务器，请两分钟后查看")
+		// 建号成功后等同于一次普通安装：下一次 tick 立即用新 id 再 POST 一次
+		// （服务端据此比对 md5 并入库），那次完成后再按 connection_mode 启动传输层。
+		a.discoveryJustBound.Store(true)
+		// 建号那次 POST 已经占用了一次尝试配额，这里必须清掉，
+		// 否则紧接着的补报会被 postAttemptAllowed 挡到下一个上报周期。
+		a.lastPostAttempt = time.Time{}
+		a.reporter.resetReportInterval()
+		a.wakeTick()
+	case agentAutoDiscoveryReused:
+		// 服务端出于防串号不会回传同名服务器的 id，这里不能引用它。
+		a.abortAutoDiscovery(agentAutoDiscoveryReused, "")
+	case agentAutoDiscoveryFailed:
+		a.abortAutoDiscovery(agentAutoDiscoveryFailed, firstNonEmpty(code, "unknown"))
+	}
+}
+
+// abortAutoDiscovery 只输出提示并置位，随后由 loop 返回错误让进程退出；不写任何文件。
+func (a *Agent) abortAutoDiscovery(kind, detail string) {
+	if a.discoveryFailed.Swap(true) {
+		return
+	}
+	switch kind {
+	case agentAutoDiscoveryReused:
+		a.log.warnf("自动发现中止：服务端已存在同名服务器，请更换 -name 后重试，或获取该服务器 ID 后改用 install -id 安装")
+	case agentAutoDiscoveryDisabled:
+		a.log.warnf("服务端未开启自动发现：请在面板「设置 → 站点设置」中开启自动发现")
+	default:
+		a.log.warnf("自动发现失败：code=%s，不再重试。%s", detail, autoDiscoveryFailureHint(detail))
+	}
+}
+
+// autoDiscoveryFailureHint 把服务端返回的失败码翻译成可执行建议。
+func autoDiscoveryFailureHint(code string) string {
+	switch code {
+	case "no_name":
+		return "服务端拿不到服务器名称，请改用 install -name=NAME 重试，或使用面板生成的 -id 安装"
+	case "db_error":
+		return "服务端建号时数据库出错，请稍后重试；持续失败请查看 Worker 日志，或改用 install -id 安装"
+	default:
+		return "请查看 Worker 日志排查，或改用 install -id 安装"
+	}
+}
+
 func (a *Agent) tick() {
 	now := time.Now()
+	if a.discoveryAbandoned() {
+		// 未绑定 id 且自动建号已中止：上报必然是 404，停止采样与上报。
+		a.samples = nil
+		return
+	}
+	if a.reportPauseRemaining(now) > 0 {
+		// 熔断期间停止采样与序列化，这是 CPU 的主要节省点。
+		// 缓冲里剩下的样本属于熔断前的窗口，直接丢弃：恢复后补发会带旧时间戳，
+		// 服务端按样本时间分桶时会出现错位数据。samples 只由本 goroutine 写入，
+		// 在这里清理不会与 transport 的失败计数产生竞争。
+		a.samples = nil
+		return
+	}
 	cfg := a.configSnapshot()
 	reportInterval := time.Duration(cfg.ReportInterval) * time.Second
 	if reportInterval < time.Second {
@@ -435,23 +673,8 @@ func (a *Agent) tick() {
 	} else {
 		a.refreshRealtimeBasicStats()
 	}
-	netNow := readNetBytes(cfg.Interface)
-	dt := now.Sub(a.prevTime).Seconds()
-	if dt <= 0 {
-		dt = float64(cfg.ReportInterval)
-	}
-	rxDelta := uint64(0)
-	txDelta := uint64(0)
-	if netNow.RX >= a.prevNet.RX {
-		rxDelta = netNow.RX - a.prevNet.RX
-	}
-	if netNow.TX >= a.prevNet.TX {
-		txDelta = netNow.TX - a.prevNet.TX
-	}
-	rxSpeed := uint64(float64(rxDelta) / dt)
-	txSpeed := uint64(float64(txDelta) / dt)
-	a.prevNet = netNow
-	a.prevTime = now
+	netNow, netErr := readNetBytes(cfg.Interface)
+	netNow, rxSpeed, txSpeed := a.networkRates(now, netNow, netErr)
 
 	cpu := "0.00"
 	if usage, ok := readCPUPercent(); ok {
@@ -459,29 +682,109 @@ func (a *Agent) tick() {
 	}
 
 	if fullDue {
-		a.monthlyRX, a.monthlyTX = calcMonthlyTraffic(a.paths.TrafficFile, netNow, cfg.ResetDay, cfg.Interface)
+		// Failed reads must not replace the persisted counter baseline with zero.
+		if netErr == nil {
+			var err error
+			a.monthlyRX, a.monthlyTX, err = calcMonthlyTraffic(a.paths.TrafficFile, netNow, cfg.ResetDay, cfg.Interface)
+			if err != nil {
+				a.log.warnfOnce("traffic-state", "monthly traffic checkpoint failed: %v", err)
+			}
+		} else if a.fullAt.IsZero() {
+			// Startup and configuration refresh must retain valid saved totals
+			// even if the first network read fails. Keep live cached totals later.
+			a.monthlyRX, a.monthlyTX = readMonthlyTrafficTotals(a.paths.TrafficFile, cfg.ResetDay, cfg.Interface, now)
+		}
 		a.diskIO = a.sampleDiskIO(now)
 		a.fullAt = now
 	}
 	m := a.buildMetrics(cfg, cpu, netNow, rxSpeed, txSpeed, a.monthlyRX, a.monthlyTX, a.diskIO)
 	if shouldSample {
-		a.samples = append(a.samples, metricSample{
-			at:      now,
-			metrics: sampleMetricsToMap(m),
-		})
-		a.lastSample = now
+		a.appendSample(now, m)
 	}
 	if shouldWSSReport || shouldPostReport {
-		if result := a.sendReport(cfg, m, shouldWSSReport, shouldPostReport, reportInterval); result.ok {
-			if result.viaWSS {
-				a.lastReport = now
-				a.lastPost = now
-			} else if result.viaPOST {
-				a.lastPost = now
-			}
-			a.samples = nil
+		a.applyReportResult(a.sendReport(cfg, m, shouldWSSReport, shouldPostReport, reportInterval), now)
+	}
+}
+
+func (a *Agent) resetNetworkBaseline(iface string) {
+	current, err := readNetBytes(iface)
+	a.prevNet = current
+	a.prevTime = time.Time{}
+	if err == nil {
+		a.prevTime = time.Now()
+	}
+}
+
+func (a *Agent) networkRates(now time.Time, current NetBytes, err error) (NetBytes, uint64, uint64) {
+	if err != nil {
+		a.log.warnfOnce("network-counters", "network counters unavailable: %v", err)
+		return a.prevNet, 0, 0
+	}
+	var rxSpeed, txSpeed uint64
+	if !a.prevTime.IsZero() {
+		if elapsed := now.Sub(a.prevTime).Seconds(); elapsed > 0 {
+			rxSpeed = uint64(float64(counterDelta(a.prevNet.RX, current.RX)) / elapsed)
+			txSpeed = uint64(float64(counterDelta(a.prevNet.TX, current.TX)) / elapsed)
 		}
 	}
+	a.prevNet = current
+	a.prevTime = now
+	return current, rxSpeed, txSpeed
+}
+
+// applyReportResult 更新上报时间，并在每次上报尝试后清空样本窗口：
+// 样本只代表当前上报间隔内的数据，失败也不留给下一次。
+// 这意味着服务端拒绝期间该窗口的采样点直接丢弃，不会在下次成功上报时补发；
+// 这是刻意取舍：补发会拖长 payload 且时间戳已经过期，服务端图表宁可有缺口。
+func (a *Agent) applyReportResult(result reportSendResult, now time.Time) {
+	defer a.persistPendingServerID()
+	// 建号那一次上报不算“已完成的上报”：不记录 lastPost/lastReport，
+	// 下一次 tick 立即带新 id 重报一次，让服务端走正常的 md5 比对与入库流程。
+	if a != nil && a.discoveryJustBound.Swap(false) {
+		a.samples = nil
+		a.discoverySyncPending.Store(true)
+		return
+	}
+	if result.ok {
+		if result.viaWSS {
+			a.lastReport = now
+			a.lastPost = now
+		} else if result.viaPOST {
+			a.lastPost = now
+		}
+	}
+	a.samples = nil
+	// 带 id 的补报已经完成，这时才按 connection_mode 启动传输层（普通安装启动即如此），
+	// 之后的节奏由 WSS / POST 自行决定。
+	if a != nil && a.discoverySyncPending.Swap(false) && a.usesWSS() {
+		a.syncReportTransport()
+	}
+}
+
+// persistPendingServerID 重试写入自动发现拿到的 id：首次写入失败时 id 只在内存里，
+// 重启后配置仍是空 id，会重新走建号流程（同名会中止、名字变了会建出重复服务器）。
+func (a *Agent) persistPendingServerID() {
+	if a == nil || a.pendingPersistID == "" {
+		return
+	}
+	if err := writeConfig(a.paths.ConfigFile, a.configSnapshot()); err != nil {
+		return
+	}
+	a.pendingPersistID = ""
+	a.log.info("自动发现 id 已写入配置 %s，重启后无需重新建号", a.paths.ConfigFile)
+}
+
+func (a *Agent) appendSample(now time.Time, m Metrics) {
+	a.samples = append(a.samples, metricSample{
+		at:      now,
+		metrics: sampleMetricsToMap(m),
+	})
+	if len(a.samples) > maxBufferedMetricSamples {
+		// 单个上报窗口的硬上限：REPORT_INTERVAL 远大于 COLLECT_INTERVAL 时也不会撑大 body。
+		copy(a.samples, a.samples[len(a.samples)-maxBufferedMetricSamples:])
+		a.samples = a.samples[:maxBufferedMetricSamples]
+	}
+	a.lastSample = now
 }
 
 func (a *Agent) refreshRealtimeBasicStats() {
@@ -586,7 +889,7 @@ func (a *Agent) report(m Metrics) {
 	reportAt := time.Now()
 	body, sampleCount, err := a.buildReportBodyForConfig(cfg, m, reportAt)
 	if err != nil {
-		a.log.warnf("marshal payload failed: %v", err)
+		a.log.warnfOnce("marshal", "marshal payload failed: %v", err)
 		return
 	}
 	a.logMetricsSummary(m)
@@ -597,7 +900,7 @@ func (a *Agent) sendReport(cfg Config, m Metrics, preferWSS, allowPOST bool, rep
 	reportAt := time.Now()
 	body, sampleCount, err := a.buildReportBodyForConfig(cfg, m, reportAt)
 	if err != nil {
-		a.log.warnf("marshal payload failed: %v", err)
+		a.log.warnfOnce("marshal", "marshal payload failed: %v", err)
 		return reportSendResult{}
 	}
 	a.logMetricsSummary(m)
@@ -605,6 +908,7 @@ func (a *Agent) sendReport(cfg Config, m Metrics, preferWSS, allowPOST bool, rep
 	if preferWSS && a.reporter != nil {
 		a.log.debugf("WSS report attempt url=%s payload_bytes=%d samples=%d", a.reporter.url(), len(body), sampleCount)
 		if a.reporter.send(body) {
+			// 写入成功不代表服务端接受，成功计数由 ack 帧触发。
 			return reportSendResult{ok: true, viaWSS: true}
 		}
 		wssFailed = true
@@ -625,8 +929,14 @@ func (a *Agent) sendReport(cfg Config, m Metrics, preferWSS, allowPOST bool, rep
 		a.reporter.delayProtocol(fmt.Sprintf("POST fallback http=%d", statusCode))
 	}
 	if err != nil || statusCode < 200 || statusCode >= 300 {
+		// 只把 4xx/5xx 视为服务端拒绝。网络错误（statusCode=0）和 3xx 不计入连续失败，
+		// 前者由 transport 自己的重连退避处理，后者理论上被 http client 跟随。
+		if statusCode >= 400 {
+			a.noteReportFailure(statusCode)
+		}
 		return reportSendResult{}
 	}
+	a.noteReportSuccess()
 	return reportSendResult{ok: true, viaPOST: true}
 }
 
@@ -656,6 +966,13 @@ func (a *Agent) buildReportBodyForConfig(cfg Config, m Metrics, reportAt time.Ti
 		"metrics":          metrics,
 		"collect_interval": cfg.CollectInterval,
 		"report_interval":  cfg.ReportInterval,
+	}
+	// 仅在自动发现阶段有意义：服务端建号时用它作为服务器名称。
+	// 绑定 id 之后不再发送，避免每次上报都带一个无用的字段。
+	if cfg.ServerID == "" {
+		if name := strings.TrimSpace(cfg.Name); name != "" {
+			payload["name"] = name
+		}
 	}
 	if a.shouldReportConfigState(firstNonEmpty(cfg.ConfigMD5, "none"), reportAt) {
 		payload["config_schema"] = configSchemaVersion
@@ -693,13 +1010,13 @@ func (a *Agent) postReportBody(cfg Config, body []byte, sampleCount int, fallbac
 		label = "POST fallback"
 	}
 	a.log.debugf("%s attempt url=%s payload_bytes=%d samples=%d", label, cfg.WorkerURL, len(body), sampleCount)
-	req, err := http.NewRequest(http.MethodPost, cfg.WorkerURL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(a.requestContext(), http.MethodPost, cfg.WorkerURL, bytes.NewReader(body))
 	if err != nil {
-		a.log.warnf("create %s request failed: %v", label, err)
+		a.log.warnfOnce("create-request:"+label, "create %s request failed: %v", label, err)
 		return 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	a.setAgentHeaders(req)
+	a.setAgentHeaders(req, cfg)
 	req.Header.Set("X-Agent-Config-Schema", configSchemaVersion)
 	req.Header.Set("X-Agent-Version", a.version)
 	req.Header.Set("X-Agent-Config-Md5", firstNonEmpty(cfg.ConfigMD5, "none"))
@@ -707,7 +1024,7 @@ func (a *Agent) postReportBody(cfg Config, body []byte, sampleCount int, fallbac
 	started := time.Now()
 	resp, err := sharedReportHTTPClient(8*time.Second, usePublicDNSResolver(cfg)).Do(req)
 	if err != nil {
-		a.log.warnf("%s failed: %v", label, err)
+		a.log.debugf("%s failed: %v", label, err)
 		return 0, err
 	}
 	headerReceived := time.Now()
@@ -740,16 +1057,25 @@ func (a *Agent) metricsForReport(m Metrics, reportAt time.Time) map[string]any {
 	return metrics
 }
 
-func (a *Agent) handleReportResponse(statusCode int, respBody []byte, headers http.Header) {
-	now := time.Now()
-	a.handleTimedReportResponse(statusCode, respBody, headers, now, now)
-}
-
 func (a *Agent) handleTimedReportResponse(statusCode int, respBody []byte, headers http.Header, started, received time.Time) {
 	a.log.debugf("report response http=%d body=%s", statusCode, strings.TrimSpace(string(respBody)))
+	// 自动建号结果可能出现在任意状态码上（created/reused 通常为 2xx，failed 为 404；
+	// 服务端建号后仍可能因载荷校验失败返回 4xx，此时同样要绑定 id，否则下次上报会再建一台），
+	// 因此必须在状态判断之前处理；也必须在 applyRemoteConfig 之前绑定 id。
+	a.applyAutoDiscoveryHeaders(headers)
+	// 未绑定 id 且收到不带自动发现标记的 404：服务端没开自动发现（或版本过旧）。
+	// 这种情况下每次上报都必然是 404，直接提示后退出，避免静默空转。
+	if statusCode == http.StatusNotFound &&
+		strings.TrimSpace(headers.Get(agentAutoDiscoveryHeader)) == "" &&
+		a.configSnapshot().ServerID == "" {
+		a.abortAutoDiscovery(agentAutoDiscoveryDisabled, "")
+		return
+	}
 	if statusCode < 200 || statusCode >= 300 {
 		return
 	}
+	// 自定义 UA 走独立通道，与配置 md5 无关；值相同时这里只做一次字符串比较。
+	a.applyRemoteUserAgent(headers.Get(agentUAHeader))
 	a.handleWSSRuntimeHeaders(headers)
 	if dateTime, ok := responseDateTime(headers); ok {
 		snapshot, updated := a.clock.updateDate(dateTime, received.Sub(started), received)
@@ -773,9 +1099,48 @@ func (a *Agent) handleTimedReportResponse(statusCode int, respBody []byte, heade
 	}
 	if statusCode == http.StatusOK {
 		if err := a.applyRemoteConfig(respBody, headers); err != nil {
-			a.log.warnf("dynamic configuration rejected: %v", err)
+			// 服务端会一直重发同一份配置，warnf 现在始终输出：
+			// 同一原因只提示一次，避免每个上报周期刷一行。
+			if key := err.Error(); key != a.lastConfigRejectKey {
+				a.lastConfigRejectKey = key
+				a.log.warnf("dynamic configuration rejected: %v", err)
+			}
+		} else {
+			a.lastConfigRejectKey = ""
 		}
 	}
+}
+
+// applyRemoteUserAgent 应用服务端下发的自定义 UA。UA 走独立通道（HTTP 响应头 / WSS ack），
+// 不参与配置 md5，因此这里只在取值不同时才落盘，避免每个上报周期重复写配置文件。
+func (a *Agent) applyRemoteUserAgent(raw string) {
+	if a == nil {
+		return
+	}
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return
+	}
+	if !isValidUserAgent(value) {
+		a.log.warnfOnce("remote-ua-invalid", "服务端下发的自定义 UA 非法，已忽略")
+		return
+	}
+	if a.configSnapshot().UA == value {
+		return
+	}
+	a.configWriteMu.Lock()
+	defer a.configWriteMu.Unlock()
+	next := a.configSnapshot()
+	if next.UA == value {
+		return
+	}
+	next.UA = value
+	if err := writeConfig(a.paths.ConfigFile, next); err != nil {
+		a.log.warnfOnce("remote-ua-write", "自定义 UA 写入配置失败: %v", err)
+		return
+	}
+	a.setConfig(next)
+	a.log.info("custom user agent updated")
 }
 
 func valueOrZero[T ~int64 | ~uint64](value *T) T {
@@ -799,9 +1164,8 @@ func (a *Agent) networkWorker(ctx context.Context) {
 			snap := ProbeSnapshot{}
 			needUpdate := false
 			if lastIP.IsZero() || now.Sub(lastIP) >= 10*time.Minute {
-				usePublicDNS := usePublicDNSResolver(cfg)
-				snap.IPv4 = lookupPublicIP("tcp4", a.log, usePublicDNS)
-				snap.IPv6 = lookupPublicIP("tcp6", a.log, usePublicDNS)
+				snap.IPv4 = lookupPublicIP("tcp4", a.log, cfg.WorkerURL)
+				snap.IPv6 = lookupPublicIP("tcp6", a.log, cfg.WorkerURL)
 				lastIP = now
 				needUpdate = true
 			}
@@ -948,7 +1312,7 @@ func (a *Agent) applyRemoteConfigWithOptions(body []byte, headers http.Header, a
 		if hasCorrection {
 			rx := values.Get("rx_correction")
 			tx := values.Get("tx_correction")
-			if err := applyTrafficCorrection(a.paths.TrafficFile, readNetBytes(cfg.Interface), cfg.Interface, rx, tx); err != nil {
+			if err := applyTrafficCorrectionFromNetwork(a.paths.TrafficFile, cfg.Interface, rx, tx); err != nil {
 				return err
 			}
 			_ = a.sendCorrectionConfirm(cfg, rx, tx)
@@ -1030,13 +1394,18 @@ func (a *Agent) applyRemoteConfigWithOptions(body []byte, headers http.Header, a
 		if hasRemoteMD5 {
 			nextCfg.ConfigMD5 = newMD5
 		}
-		if err := writeConfig(a.paths.ConfigFile, nextCfg); err != nil {
-			return err
+		// 与 UA 下发通道串行化：UA 不参与 md5，写盘时保留当前值，避免互相覆盖。
+		a.configWriteMu.Lock()
+		nextCfg.UA = a.configSnapshot().UA
+		writeErr := writeConfig(a.paths.ConfigFile, nextCfg)
+		if writeErr == nil {
+			a.setConfig(nextCfg)
 		}
-		a.setConfig(nextCfg)
-		now := time.Now()
-		a.prevNet = readNetBytes(nextCfg.Interface)
-		a.prevTime = now
+		a.configWriteMu.Unlock()
+		if writeErr != nil {
+			return writeErr
+		}
+		a.resetNetworkBaseline(nextCfg.Interface)
 		a.prevDisk = DiskIOCounters{}
 		a.prevDiskAt = time.Time{}
 		a.diskIO = DiskIOStats{}
@@ -1061,7 +1430,7 @@ func (a *Agent) applyRemoteConfigWithOptions(body []byte, headers http.Header, a
 	if hasCorrection {
 		rx := values.Get("rx_correction")
 		tx := values.Get("tx_correction")
-		if err := applyTrafficCorrection(a.paths.TrafficFile, readNetBytes(cfg.Interface), cfg.Interface, rx, tx); err != nil {
+		if err := applyTrafficCorrectionFromNetwork(a.paths.TrafficFile, cfg.Interface, rx, tx); err != nil {
 			return err
 		}
 		_ = a.sendCorrectionConfirm(cfg, rx, tx)
@@ -1115,9 +1484,9 @@ func inIntSet(v int, allowed ...int) bool {
 	return false
 }
 
-func (a *Agent) setAgentHeaders(req *http.Request) {
+func (a *Agent) setAgentHeaders(req *http.Request, cfg Config) {
 	req.Header.Set("Accept", "*/*")
-	req.Header.Set("User-Agent", "cfsm")
+	req.Header.Set("User-Agent", firstNonEmpty(cfg.UA, defaultUserAgent))
 }
 
 func (a *Agent) sendCorrectionConfirm(cfg Config, rx, tx string) error {
@@ -1134,12 +1503,12 @@ func (a *Agent) sendCorrectionConfirm(cfg Config, rx, tx string) error {
 		"tx_correction": parseFloatDefault(tx, 0),
 	}
 	body, _ := json.Marshal(payload)
-	req, err := http.NewRequest(http.MethodPost, cfg.WorkerURL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(a.requestContext(), http.MethodPost, cfg.WorkerURL, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	a.setAgentHeaders(req)
+	a.setAgentHeaders(req, cfg)
 	client := http.Client{Timeout: 4 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {

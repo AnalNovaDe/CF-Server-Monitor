@@ -10,7 +10,7 @@ import (
 )
 
 func Install(opts InstallOptions, version string) error {
-	paths := defaultPaths()
+	paths := pathsForInstance(opts.Instance)
 	printBanner(version)
 	if err := requireInstallPermission(paths); err != nil {
 		return err
@@ -19,7 +19,29 @@ func Install(opts InstallOptions, version string) error {
 		return err
 	}
 
-	if !paths.UserMode {
+	existing, existingPath, existingErr := readInstallConfig(paths)
+	usingExistingConfig := existingErr == nil
+	if usingExistingConfig {
+		fmt.Printf("[INFO] 检测到已有配置，沿用 %s（本次只覆盖显式传入的参数）\n", existingPath)
+		flagConfig := opts.Config
+		opts.Config = existing
+		mergeExplicitInstallConfig(&opts.Config, flagConfig, opts.Explicit)
+	} else if opts.Secret == "" || opts.WorkerURL == "" {
+		printUsage(os.Stderr)
+		return errors.New("首次安装必须提供 -secret 和 -url，例如: cf-probe install -id=SERVER_ID -secret=SECRET -url=WORKER_URL")
+	}
+	if !usingExistingConfig || opts.ConfigMD5 == "" {
+		opts.ConfigMD5 = "none"
+	}
+	normalizeConfigIntervals(&opts.Config)
+
+	// Validate and sample before stopping either the current or a legacy service.
+	correctionNet, err := prepareInstallTrafficCorrection(opts, readNetBytes)
+	if err != nil {
+		return err
+	}
+	if !paths.UserMode && paths.Instance == "" {
+		// 旧版 shell 探针是全局单实例安装，只有默认实例负责清理。
 		if cleaned, residuals := cleanupLegacyInstall(paths); len(cleaned) > 0 || len(residuals) > 0 {
 			if len(cleaned) > 0 {
 				fmt.Printf("[INFO] Cleaned legacy shell probe artifacts: %s\n", strings.Join(cleaned, ", "))
@@ -33,23 +55,6 @@ func Install(opts InstallOptions, version string) error {
 		}
 	}
 
-	existing, existingPath, existingErr := readInstallConfig(paths)
-	usingExistingConfig := existingErr == nil
-	if usingExistingConfig {
-		fmt.Printf("[INFO] Config source: %s\n", existingPath)
-		fmt.Printf("[INFO] 检测到已有配置，沿用 %s\n", paths.ConfigFile)
-		flagConfig := opts.Config
-		opts.Config = existing
-		mergeExplicitInstallConfig(&opts.Config, flagConfig, opts.Explicit)
-	} else if opts.ServerID == "" || opts.Secret == "" || opts.WorkerURL == "" {
-		printUsage(os.Stderr)
-		return errors.New("运行所需的 -id/-secret/-url 参数不完整")
-	}
-	if !usingExistingConfig || opts.ConfigMD5 == "" {
-		opts.ConfigMD5 = "none"
-	}
-	normalizeConfigIntervals(&opts.Config)
-
 	fmt.Printf("[INFO] Platform: %s/%s (%s)\n", runtime.GOOS, nativeArch(), platformName())
 	if paths.UserMode {
 		fmt.Printf("[INFO] Install mode: user (%s)\n", firstNonEmpty(paths.RunUser, "current"))
@@ -61,7 +66,7 @@ func Install(opts InstallOptions, version string) error {
 	printWindowsAutoUpdateWarning(paths, opts)
 
 	stopService(paths)
-	stopCurrentUserProbeInstances()
+	stopCurrentUserProbeInstances(paths)
 	if err := copySelfTo(paths.BinaryFile); err != nil {
 		return fmt.Errorf("安装二进制失败: %w", err)
 	}
@@ -74,8 +79,11 @@ func Install(opts InstallOptions, version string) error {
 	if err := writeConfig(paths.ConfigFile, opts.Config); err != nil {
 		return fmt.Errorf("写入配置失败: %w", err)
 	}
+	if err := writeInstanceMarker(paths); err != nil {
+		return fmt.Errorf("写入实例标记失败: %w", err)
+	}
 	if opts.RXCorrectionGB != "" || opts.TXCorrectionGB != "" {
-		if err := applyTrafficCorrection(paths.TrafficFile, readNetBytes(opts.Interface), opts.Interface, opts.RXCorrectionGB, opts.TXCorrectionGB); err != nil {
+		if err := applyTrafficCorrection(paths.TrafficFile, correctionNet, opts.Interface, opts.RXCorrectionGB, opts.TXCorrectionGB); err != nil {
 			return err
 		}
 	}
@@ -94,11 +102,30 @@ func Install(opts InstallOptions, version string) error {
 	return nil
 }
 
+func prepareInstallTrafficCorrection(opts InstallOptions, readCounters func(string) (NetBytes, error)) (NetBytes, error) {
+	if opts.RXCorrectionGB == "" && opts.TXCorrectionGB == "" {
+		return NetBytes{}, nil
+	}
+	if _, err := parseTrafficCorrectionGB(opts.RXCorrectionGB); err != nil {
+		return NetBytes{}, err
+	}
+	if _, err := parseTrafficCorrectionGB(opts.TXCorrectionGB); err != nil {
+		return NetBytes{}, err
+	}
+	current, err := readCounters(opts.Interface)
+	if err != nil {
+		return NetBytes{}, fmt.Errorf("read network counters before traffic correction: %w", err)
+	}
+	return current, nil
+}
+
 func mergeExplicitInstallConfig(dst *Config, src Config, explicit map[string]bool) {
 	for name := range explicit {
 		switch name {
 		case "id":
 			dst.ServerID = src.ServerID
+		case "name":
+			dst.Name = src.Name
 		case "secret":
 			dst.Secret = src.Secret
 		case "url":
@@ -131,6 +158,8 @@ func mergeExplicitInstallConfig(dst *Config, src Config, explicit map[string]boo
 			dst.ConnectionMode = src.ConnectionMode
 		case "ping_mode":
 			dst.PingMode = src.PingMode
+		case "ua":
+			dst.UA = src.UA
 		case "auto_update":
 			dst.AutoUpdate = src.AutoUpdate
 		case "install_ghproxy":
@@ -150,14 +179,42 @@ func printWindowsAutoUpdateWarning(paths Paths, opts InstallOptions) {
 		windowsTaskWrapperFile(paths))
 }
 
-func Uninstall(version string) error {
-	paths := defaultPaths()
+func Uninstall(opts UninstallOptions, version string) error {
+	paths := pathsForInstance(opts.Instance)
 	printBanner(version)
 	if err := requireUninstallPermission(paths); err != nil {
 		return err
 	}
+	if opts.All {
+		return uninstallAll(paths)
+	}
+	if opts.Instance == "" {
+		if inst := currentExecutableInstance(); inst != "" {
+			return fmt.Errorf("当前可执行文件属于实例 %s，请改用 cf-probe uninstall -instance=%s；如需清理全部实例请使用 --all", inst, inst)
+		}
+	}
 	fmt.Printf("[INFO] 开始卸载 %s\n", paths.ServiceName)
 	residuals := deepUninstall(paths)
+	if len(residuals) > 0 {
+		for _, item := range residuals {
+			fmt.Printf("[WARN] 卸载残留: %s\n", item)
+		}
+		return fmt.Errorf("卸载未完全清理，仍有 %d 项残留", len(residuals))
+	}
+	fmt.Println("[INFO] 卸载完成")
+	return nil
+}
+
+func uninstallAll(base Paths) error {
+	targets := []Paths{base}
+	for _, name := range installedInstanceNames(base) {
+		targets = append(targets, pathsForInstance(name))
+	}
+	var residuals []string
+	for _, paths := range targets {
+		fmt.Printf("[INFO] 开始卸载 %s\n", paths.ServiceName)
+		residuals = append(residuals, deepUninstall(paths)...)
+	}
 	if len(residuals) > 0 {
 		for _, item := range residuals {
 			fmt.Printf("[WARN] 卸载残留: %s\n", item)
@@ -181,7 +238,7 @@ func removeInstalledFiles(paths Paths) {
 }
 
 func darwinLegacyUserLogFile(paths Paths) string {
-	if runtime.GOOS != "darwin" || !paths.UserMode {
+	if runtime.GOOS != "darwin" || !paths.UserMode || paths.Instance != "" {
 		return ""
 	}
 	home := paths.HomeDir
@@ -278,25 +335,30 @@ func printInstallSummary(paths Paths, opts InstallOptions) {
 	fmt.Println("    CF-Server-Monitor Go Probe 安装成功")
 	fmt.Println("===========================================")
 	fmt.Printf("  Service     : %s\n", paths.ServiceName)
+	if paths.Instance != "" {
+		fmt.Printf("  Instance    : %s\n", paths.Instance)
+	}
 	fmt.Printf("  Binary      : %s\n", paths.BinaryFile)
 	fmt.Printf("  Config      : %s\n", paths.ConfigFile)
-	fmt.Printf("  Server ID   : %s\n", opts.ServerID)
+	if opts.ServerID != "" {
+		fmt.Printf("  Server ID   : %s\n", opts.ServerID)
+	}
+	if opts.Name != "" {
+		fmt.Printf("  Server Name : %s\n", opts.Name)
+	}
 	fmt.Printf("  Secret      : ********\n")
 	fmt.Printf("  Worker URL  : %s\n", opts.WorkerURL)
-	fmt.Printf("  Report      : %d秒\n", opts.ReportInterval)
-	fmt.Printf("  Collect     : %d秒\n", opts.CollectInterval)
-	fmt.Printf("  Connection  : %s\n", opts.ConnectionMode)
-	fmt.Printf("  Auto Update : %v\n", opts.AutoUpdate)
 	fmt.Printf("  Debug       : %v\n", opts.Debug)
-	fmt.Printf("  Interface   : %s\n", firstNonEmpty(opts.Interface, "自动汇总"))
-	if opts.ResetDay == 0 {
-		fmt.Println("  Reset Day   : 不重置")
-	} else {
-		fmt.Printf("  Reset Day   : %d号\n", opts.ResetDay)
-	}
 	printProbeNodes(opts)
 	printManagementCommands(paths)
 	fmt.Println("===========================================")
+	if opts.ServerID == "" {
+		fmt.Println("")
+		fmt.Println("  本次未传 -id，由服务端在首次上报时自动建号：")
+		fmt.Println("    - 用上方「实时日志」命令查看，出现「自动发现已创建服务器」即建号成功")
+		fmt.Println("    - 建号成功后约 2 分钟，面板才会显示该服务器")
+		fmt.Println("    - 若出现「自动发现中止」或「自动发现失败」，服务会退出，按日志原因处理后重新执行 install")
+	}
 }
 
 func initSystem() string {
@@ -412,7 +474,12 @@ func startService(paths Paths, debug bool) error {
 		if debug {
 			debugArg = "-debug=1"
 		}
-		return startDetached(paths.BinaryFile, []string{"run", debugArg}, paths.LogFile, paths.PIDFile)
+		args := []string{"run"}
+		if paths.Instance != "" {
+			args = append(args, "-instance="+paths.Instance)
+		}
+		args = append(args, debugArg)
+		return startDetached(paths.BinaryFile, args, paths.LogFile, paths.PIDFile)
 	}
 }
 
@@ -492,6 +559,7 @@ func writeSystemdService(paths Paths, debug bool) error {
 	if debug {
 		debugArg = "1"
 	}
+	instanceArg := instanceRunArg(paths)
 	content := fmt.Sprintf(`[Unit]
 Description=CF Server Monitor Probe Agent
 After=network.target network-online.target
@@ -499,8 +567,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%s run -debug=%s
-Restart=always
+ExecStart=%s run%s -debug=%s
+Restart=on-failure
 RestartSec=5
 User=root
 Group=root
@@ -514,7 +582,7 @@ SyslogIdentifier=%s
 
 [Install]
 WantedBy=multi-user.target
-`, paths.BinaryFile, debugArg, paths.ServiceName)
+`, paths.BinaryFile, instanceArg, debugArg, paths.ServiceName)
 	return writeFileExecutable(paths.ServiceFile, content, 0o644)
 }
 
@@ -523,14 +591,18 @@ func writeSystemdUserService(paths Paths, debug bool) error {
 	if debug {
 		debugArg = "1"
 	}
+	instanceArg := ""
+	if paths.Instance != "" {
+		instanceArg = " " + quoteSystemdExecArg("-instance="+paths.Instance)
+	}
 	content := fmt.Sprintf(`[Unit]
 Description=CF Server Monitor Probe Agent
 After=default.target
 
 [Service]
 Type=simple
-ExecStart=%s run -config=%s -debug=%s
-Restart=always
+ExecStart=%s run%s -config=%s -debug=%s
+Restart=on-failure
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
@@ -538,7 +610,7 @@ SyslogIdentifier=%s
 
 [Install]
 WantedBy=default.target
-`, quoteSystemdExecArg(paths.BinaryFile), quoteSystemdExecArg(paths.ConfigFile), debugArg, paths.ServiceName)
+`, quoteSystemdExecArg(paths.BinaryFile), instanceArg, quoteSystemdExecArg(paths.ConfigFile), debugArg, paths.ServiceName)
 	return writeFileExecutable(paths.ServiceFile, content, 0o644)
 }
 
@@ -548,7 +620,7 @@ func writeOpenRCService(paths Paths, debug bool) error {
 name="CF Server Monitor Probe Agent"
 description="CF Server Monitor Probe Agent"
 command="%s"
-command_args="run -debug=%s"
+command_args="run%s -debug=%s"
 pidfile="/run/%s.pid"
 retry="SIGTERM/30"
 supervisor=supervise-daemon
@@ -559,7 +631,7 @@ depend() {
     need net
     after network
 }
-`, paths.BinaryFile, boolInt(debug), paths.ServiceName, paths.LogFile, paths.LogFile), 0o755)
+`, paths.BinaryFile, instanceRunArg(paths), boolInt(debug), paths.ServiceName, paths.LogFile, paths.LogFile), 0o755)
 }
 
 func writeProcdService(paths Paths, debug bool) error {
@@ -571,7 +643,7 @@ USE_PROCD=1
 
 start_service() {
     procd_open_instance
-    procd_set_param command %s run -debug=%s
+    procd_set_param command %s run%s -debug=%s
     procd_set_param respawn
     procd_set_param stdout 1
     procd_set_param stderr 1
@@ -581,7 +653,7 @@ start_service() {
 stop_service() {
     killall %s 2>/dev/null
 }
-`, paths.BinaryFile, boolInt(debug), filepath.Base(paths.BinaryFile)), 0o755)
+`, paths.BinaryFile, instanceRunArg(paths), boolInt(debug), filepath.Base(paths.BinaryFile)), 0o755)
 }
 
 func writeLaunchdService(paths Paths, debug bool) error {
@@ -593,9 +665,12 @@ func writeLaunchdService(paths Paths, debug bool) error {
 	if runtime.GOOS == "darwin" && !paths.UserMode && isRootUser() {
 		userBlock = "    <key>UserName</key>\n    <string>root</string>\n"
 	}
-	configArg := ""
+	extraArgs := ""
+	if paths.Instance != "" {
+		extraArgs += fmt.Sprintf("        <string>-instance=%s</string>\n", paths.Instance)
+	}
 	if paths.UserMode {
-		configArg = fmt.Sprintf("        <string>-config=%s</string>\n", paths.ConfigFile)
+		extraArgs += fmt.Sprintf("        <string>-config=%s</string>\n", paths.ConfigFile)
 	}
 	content := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -607,20 +682,22 @@ func writeLaunchdService(paths Paths, debug bool) error {
     <array>
         <string>%s</string>
         <string>run</string>
-%s
-        <string>-debug=%s</string>
+%s        <string>-debug=%s</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
 %s    <key>StandardOutPath</key>
     <string>%s</string>
     <key>StandardErrorPath</key>
     <string>%s</string>
 </dict>
 </plist>
-`, paths.LaunchdLabel, paths.BinaryFile, configArg, boolInt(debug), userBlock, paths.LogFile, paths.LogFile)
+`, paths.LaunchdLabel, paths.BinaryFile, extraArgs, boolInt(debug), userBlock, paths.LogFile, paths.LogFile)
 	return writeFileExecutable(plist, content, 0o644)
 }
 
@@ -633,9 +710,9 @@ respawn
 respawn limit 10 5
 
 script
-    exec %s run -debug=%s
+    exec %s run%s -debug=%s
 end script
-`, paths.BinaryFile, boolInt(debug)), 0o644)
+`, paths.BinaryFile, instanceRunArg(paths), boolInt(debug)), 0o644)
 }
 
 func writeSynologyRCService(paths Paths, debug bool) error {
@@ -645,7 +722,7 @@ func writeSynologyRCService(paths Paths, debug bool) error {
 BIN=%s
 PID=%s
 LOG=%s
-ARGS="run -debug=%s"
+ARGS="run%s -debug=%s"
 
 start() {
     if [ -f "$PID" ] && kill -0 "$(cat "$PID")" 2>/dev/null; then
@@ -669,14 +746,16 @@ case "$1" in
     restart) stop; sleep 1; start ;;
     *) echo "usage: $0 {start|stop|restart}"; exit 1 ;;
 esac
-`, paths.BinaryFile, paths.PIDFile, paths.LogFile, boolInt(debug), paths.ServiceName), 0o755)
+`, paths.BinaryFile, paths.PIDFile, paths.LogFile, instanceRunArg(paths), boolInt(debug), paths.ServiceName), 0o755)
 }
 
 func writeWindowsService(paths Paths, debug bool) error {
 	if err := writeWindowsTaskWrapper(paths, debug); err != nil {
 		return err
 	}
-	_ = runCommand("schtasks", "/Delete", "/TN", paths.ServiceName, "/F")
+	// Quiet: on a first install the task does not exist yet and schtasks would
+	// print a localized "系统找不到指定的文件" error to stderr.
+	_ = runCommandQuiet("schtasks", "/Delete", "/TN", paths.ServiceName, "/F")
 	taskXML, cleanup, err := writeWindowsScheduledTaskXML(paths, debug)
 	if err != nil {
 		return fmt.Errorf("%w: %v", errWindowsService, err)
@@ -727,4 +806,13 @@ func boolInt(v bool) string {
 		return "1"
 	}
 	return "0"
+}
+
+// instanceRunArg 返回拼进服务启动命令的实例参数；默认实例返回空串，
+// 保证不带 -instance 安装时生成的服务定义与历史版本一致。
+func instanceRunArg(paths Paths) string {
+	if paths.Instance == "" {
+		return ""
+	}
+	return " -instance=" + paths.Instance
 }

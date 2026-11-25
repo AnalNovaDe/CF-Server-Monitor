@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 	"unicode/utf16"
@@ -30,8 +29,8 @@ const windowsResumeEventSubscription = `<QueryList>
   </Query>
 </QueryList>`
 
-func defaultPaths() Paths {
-	serviceName := serviceNameDefault
+func pathsForInstance(instance string) Paths {
+	serviceName := instanceServiceName(instance)
 	programData := os.Getenv("ProgramData")
 	if programData == "" {
 		programData = `C:\ProgramData`
@@ -41,16 +40,21 @@ func defaultPaths() Paths {
 		installDir = `C:\Program Files\cf-probe`
 	}
 	binary := filepath.Join(installDir, serviceName+".exe")
-	configDir := filepath.Join(programData, "cf-probe")
+	configDir := filepath.Join(programData, serviceName)
+	oldTrafficFile := filepath.Join(programData, "cf-probe", "traffic.dat")
+	if instance != "" {
+		oldTrafficFile = ""
+	}
 	return Paths{
+		Instance:       instance,
 		ServiceName:    serviceName,
 		BinaryFile:     binary,
 		ConfigDir:      configDir,
 		ConfigFile:     filepath.Join(configDir, "config.conf"),
 		TrafficFile:    filepath.Join(configDir, "traffic.dat"),
-		OldTrafficFile: filepath.Join(programData, "cf-probe", "traffic.dat"),
-		PIDFile:        filepath.Join(programData, "cf-probe", serviceName+".pid"),
-		LogFile:        filepath.Join(programData, "cf-probe", serviceName+".log"),
+		OldTrafficFile: oldTrafficFile,
+		PIDFile:        filepath.Join(configDir, serviceName+".pid"),
+		LogFile:        filepath.Join(configDir, serviceName+".log"),
 		ServiceFile:    serviceName,
 		DebugEnvFile:   filepath.Join(configDir, "debug.env"),
 		LaunchdLabel:   "",
@@ -59,18 +63,31 @@ func defaultPaths() Paths {
 }
 
 func requireInstallPermission(_ Paths) error {
+	if !isElevated() {
+		return errors.New("Windows 安装需要管理员权限，请以管理员身份重新打开 PowerShell 后重试（右键 PowerShell 选择“以管理员身份运行”）")
+	}
 	return nil
 }
 
 func requireUninstallPermission(_ Paths) error {
+	if !isElevated() {
+		return errors.New("Windows 卸载需要管理员权限，请以管理员身份重新打开 PowerShell 后重试（右键 PowerShell 选择“以管理员身份运行”）")
+	}
 	return nil
+}
+
+// isElevated reports whether the current process token is elevated (UAC).
+// Group membership alone is not enough: under UAC a standard administrator
+// runs with a filtered token, so the token elevation flag must be checked.
+func isElevated() bool {
+	return xwindows.GetCurrentProcessToken().IsElevated()
 }
 
 func checkInstallConflicts(_ Paths) error {
 	return nil
 }
 
-func stopCurrentUserProbeInstances() {
+func stopCurrentUserProbeInstances(_ Paths) {
 }
 
 func acquireInstanceLock(_ Paths) (func(), error) {
@@ -152,7 +169,9 @@ func stopDetached(pidFile string) {
 }
 
 func stopWindowsScheduledTask(paths Paths) {
-	_ = runCommand("schtasks", "/End", "/TN", paths.ServiceName)
+	// Quiet: the task may not exist yet (first install), and schtasks would
+	// otherwise print a localized "系统找不到指定的文件" error to stderr.
+	_ = runCommandQuiet("schtasks", "/End", "/TN", paths.ServiceName)
 	stopWindowsProbeProcesses(paths)
 	waitWindowsProbeProcessesStopped(paths, 5*time.Second)
 }
@@ -472,14 +491,6 @@ func runCommandQuiet(name string, args ...string) error {
 	return cmd.Run()
 }
 
-func commandOutput(name string, args ...string) string {
-	out, err := exec.Command(name, args...).Output()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(out))
-}
-
 func commandExists(name string) bool {
 	_, err := exec.LookPath(name)
 	return err == nil
@@ -682,12 +693,17 @@ func writeWindowsTaskWrapper(paths Paths, debug bool) error {
 	if debug {
 		debugArg = "-debug=1"
 	}
+	runArgs := "run"
+	if paths.Instance != "" {
+		runArgs += " -instance=" + paths.Instance
+	}
+	runArgs += " " + debugArg
 	content := strings.Join([]string{
 		"@echo off",
 		"setlocal",
 		"if not exist " + quoteWindowsCmdArg(paths.ConfigDir) + " mkdir " + quoteWindowsCmdArg(paths.ConfigDir),
 		"echo [%DATE% %TIME%] cf-probe task starting >> " + quoteWindowsCmdArg(paths.LogFile),
-		quoteWindowsCmdArg(paths.BinaryFile) + " run " + debugArg + " >> " + quoteWindowsCmdArg(paths.LogFile) + " 2>&1",
+		quoteWindowsCmdArg(paths.BinaryFile) + " " + runArgs + " >> " + quoteWindowsCmdArg(paths.LogFile) + " 2>&1",
 		"exit /b %ERRORLEVEL%",
 		"",
 	}, "\r\n")
@@ -739,19 +755,7 @@ func isSynology() bool {
 	return false
 }
 
-func executableForRelease(goos, goarch string) string {
-	name := fmt.Sprintf("cf-probe-%s-%s", goos, goarch)
-	if goos == "windows" {
-		name += ".exe"
-	}
-	return name
-}
-
 var errWindowsService = errors.New("Windows 计划任务创建失败，请确认以管理员身份运行 PowerShell")
-
-func runtimeGOOS() string {
-	return runtime.GOOS
-}
 
 func isRootUser() bool {
 	return false

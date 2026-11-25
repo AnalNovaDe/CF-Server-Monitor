@@ -3,8 +3,8 @@
 package cfprobe
 
 import (
+	"errors"
 	"runtime"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -33,8 +33,8 @@ func readMemoryStats() (MemoryStats, bool) {
 	return MemoryStats{}, false
 }
 
-func readNetBytes(_ string) NetBytes {
-	return NetBytes{}
+func readNetBytes(_ string) (NetBytes, error) {
+	return NetBytes{}, errors.New("network counters are unsupported on this platform")
 }
 
 func readDiskIOCounters(_ []DiskDeviceRef) DiskIOCounters {
@@ -86,7 +86,3 @@ func commandLineCount(name string, args ...string) int {
 	return count
 }
 
-func parseInt(raw string) int {
-	n, _ := strconv.Atoi(strings.TrimSpace(raw))
-	return n
-}

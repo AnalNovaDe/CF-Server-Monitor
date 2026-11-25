@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Fixed release bootstrap for Linux systemd. No secrets belong in this file.
-# installer-release: agent-installer-1.0.4
+# installer-release: agent-installer-1.0.5
 set -Eeuo pipefail
 umask 077
-cfm_release='https://github.com/AnalNovaDe/CF-Server-Monitor/releases/download/agent-1.0.19-latency.5'
-cfm_version='CF-Server-Monitor Go Probe 1.0.19-latency.5'
+cfm_release='https://github.com/AnalNovaDe/CF-Server-Monitor/releases/download/agent-1.1.4-latency.1'
+cfm_version='CF-Server-Monitor Go Probe 1.1.4-latency.1'
 cfm_id='' cfm_secret='' cfm_url=''
 cfm_args=("$@")
 for cfm_arg in "$@"; do
@@ -20,8 +20,8 @@ cfm_die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 [[ $cfm_id =~ ^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$ && -n $cfm_secret ]] || cfm_die 'Missing server ID or secret.'
 [[ $cfm_url == https://*/update ]] || cfm_die 'An HTTPS /update URL is required.'
 case "$(uname -m)" in
-  x86_64|amd64) cfm_arch=amd64; cfm_sha=4f256fc7b0e61fc91c238461a41d01f7591adc1294141bcc775f1c064c9f28f4 ;;
-  aarch64|arm64) cfm_arch=arm64; cfm_sha=07b5e1a27d370d77003d59744a57b0fed3b0b1733059c67172446f910d5520d2 ;;
+  x86_64|amd64) cfm_arch=amd64; cfm_sha=17c421062edf53f0f8900435ffd455d909f7203f3549a76931391711659e4474 ;;
+  aarch64|arm64) cfm_arch=arm64; cfm_sha=282c9d126a4c0449f19f955ca46772a107cae5a8ff73bf5a50ca912269cf7843 ;;
   *) cfm_die 'Only Linux amd64 and arm64 are supplied in this release.' ;;
 esac
 for cfm_tool in curl sha256sum awk systemctl mktemp cp mv chmod; do
@@ -82,8 +82,8 @@ chmod 700 "$cfm_tmp/cf-probe"
 cfm_status=$(curl --proto '=https' -sS --connect-timeout 10 --max-time 30 --max-redirs 0 -o "$cfm_tmp/readiness.json" -w '%{http_code}' \
   -H "Authorization: Bearer $cfm_secret" -H 'Content-Type: application/json' \
   --data "{\"id\":\"$cfm_id\"}" "${cfm_url%/update}/update/latency-check")
-[[ $cfm_status == 200 ]] || cfm_die "Worker readiness check failed ($cfm_status). Check the node allowlist and migration; no installation files changed."
-[[ $(< "$cfm_tmp/readiness.json") == '{"enabled":true,"version":"1.0.19-latency.5"}' ]] || cfm_die 'Worker did not confirm the custom installation protocol; no installation files changed.'
+[[ $cfm_status == 200 ]] || cfm_die "Worker readiness check failed ($cfm_status). Check free dense-history slots (10 maximum) and migration; no installation files changed."
+[[ $(< "$cfm_tmp/readiness.json") == '{"enabled":true,"version":"1.1.4-latency.1"}' ]] || cfm_die 'Worker did not confirm the custom installation protocol; no installation files changed.'
 "${cfm_systemctl[@]}" show-environment >/dev/null
 cfm_fragment=$("${cfm_systemctl[@]}" show cf-probe.service -p FragmentPath --value 2>/dev/null || true)
 [[ -z $cfm_fragment || $cfm_fragment == "$cfm_unit" ]] || cfm_die 'Unexpected service location; review manually.'
@@ -108,6 +108,6 @@ cfm_stage=''
 for cfm_attempt in 1 2 3 4 5; do sleep 1; "${cfm_systemctl[@]}" is-active --quiet cf-probe.service; done
 "${cfm_systemctl[@]}" is-enabled --quiet cf-probe.service
 trap - ERR INT TERM
-printf 'Installed: 1.0.19-latency.5. BACKUP_PATH=%s\n' "$cfm_backup"
+printf 'Installed: 1.1.4-latency.1. BACKUP_PATH=%s\n' "$cfm_backup"
 "${cfm_systemctl[@]}" show cf-probe.service -p ActiveState -p MainPID -p UnitFileState
 printf 'LATENCY_DETAIL=1 AUTO_UPDATE=0. Verify new history after 2-3 minutes and review free usage.\n'

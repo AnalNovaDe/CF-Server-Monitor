@@ -10,18 +10,24 @@ const (
 	configSchemaVersion         = "7"
 	defaultReportIntervalSec    = 60
 	defaultWSSReportIntervalSec = 2
-	minWSSReportIntervalSec     = 1
-	maxWSSReportIntervalSec     = 5
-	connectionModeAuto          = "auto"
-	connectionModeHTTP          = "http"
-	pingModeTCP                 = "tcp"
-	pingModeICMP                = "icmp"
+	// 单个上报窗口的硬上限：正常 60s/2s 窗口约 30 条，只有 REPORT_INTERVAL 远大于
+	// COLLECT_INTERVAL 时才会触顶；数值与服务端 UPDATE_MAX_BATCH_SAMPLES 保持一致。
+	maxBufferedMetricSamples = 300
+	minWSSReportIntervalSec  = 1
+	maxWSSReportIntervalSec  = 5
+	connectionModeAuto       = "auto"
+	connectionModeHTTP       = "http"
+	pingModeTCP              = "tcp"
+	pingModeICMP             = "icmp"
+	defaultUserAgent         = "cfsm"
+	maxUserAgentLength       = 100
 )
 
 type Config struct {
 	ServerID        string
 	Secret          string
 	WorkerURL       string
+	Name            string // 仅在自动发现阶段使用：未绑定 server id 时作为新建服务器的名称。
 	CollectInterval int
 	ReportInterval  int
 	CTNode          string
@@ -36,8 +42,11 @@ type Config struct {
 	ResetDay        int
 	ConnectionMode  string
 	PingMode        string
-	AutoUpdate      bool
-	LatencyDetail   bool // Local opt-in; never part of remote config MD5.
+	// UA 是上报请求的自定义 User-Agent，由服务端通过独立通道下发（不参与 ConfigMD5 比对），
+	// 本地安装参数 -ua 只作为初值。
+	UA            string
+	AutoUpdate    bool
+	LatencyDetail bool // Local opt-in; never part of remote config MD5.
 	UpdateProxy     string
 	// ConfigMD5 mirrors the worker dynamic config version; local fields like
 	// AutoUpdate and UpdateProxy are intentionally outside that comparison.
@@ -45,6 +54,8 @@ type Config struct {
 }
 
 type Paths struct {
+	// Instance 为空表示默认实例（历史行为，路径与服务名保持 cf-probe 不变）。
+	Instance        string
 	ServiceName     string
 	BinaryFile      string
 	ConfigDir       string
@@ -66,11 +77,19 @@ type Paths struct {
 
 type InstallOptions struct {
 	Config
+	Instance       string
 	Debug          bool
+	// NoStart (custom installer only): install without starting, so the installer can
+	// write LATENCY_DETAIL/AUTO_UPDATE before the first start. Removed upstream in f29b735.
+	NoStart        bool
 	RXCorrectionGB string
 	TXCorrectionGB string
-	NoStart        bool
 	Explicit       map[string]bool
+}
+
+type UninstallOptions struct {
+	Instance string
+	All      bool
 }
 
 type ProbeResult struct {
